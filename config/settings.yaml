@@ -1,0 +1,45 @@
+# Forex Telegram Agent — MT5 / Exness settings
+
+pairs:
+  - EURUSD
+  - GBPUSD
+  - USDJPY
+  - AUDUSD
+  - USDCAD
+  - XAUUSD
+
+# Signal timeframe (Yahoo for analysis; orders go to MT5)
+timeframe: "15m"
+history_period: "5d"
+
+strategy:
+  name: "multi_indicator"
+  rsi_period: 14
+  rsi_oversold: 30
+  rsi_overbought: 70
+  ema_fast: 9
+  ema_slow: 21
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  min_score: 2
+  atr_period: 14
+  sl_atr_mult: 1.5
+  tp_atr_mult: 2.5
+
+risk:
+  max_open_positions: 3
+  risk_per_trade_pct: 1.0
+  max_daily_loss_pct: 5.0
+  max_lot_size: 0.10
+  min_lot_size: 0.01
+
+# Auto trade every N minutes (opens MT5 trades on actionable signals)
+scan_interval_minutes: 15
+auto_trade_on_start: true   # start auto trading without /auto on
+auto_trade_enabled: true    # place real MT5 orders (not alerts only)
+max_new_trades_per_cycle: 1 # open at most this many new positions each cycle
+
+quiet_hours:
+  start_hour_utc: null
+  end_hour_utc: null
