@@ -1,19 +1,27 @@
-"""Telegram interface — MT5 Exness trading agent."""
+"""Telegram interface — MT5 Exness trading agent + PDF signal sheets."""
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
+from src.agent.pdf_signals import clear_book, load_pdf_book, load_saved_book
 from src.agent.strategy import ForexAgent
 from src.data.market_data import fetch_quote
 from src.trading.mt5_broker import MT5Broker
-from src.utils.config import allowed_user_ids, env_str
+from src.utils.config import RUNTIME_DIR, allowed_user_ids, env_str
 
 logger = logging.getLogger(__name__)
 
@@ -22,18 +30,25 @@ HELP_TEXT = """
 
 /start — welcome
 /help — help
-/status — MT5 account + auto status
-/mt5 — reconnect / diagnose MT5
+/status — MT5 + PDF status
+/mt5 — reconnect MT5
 /price `<PAIR>` — quote
-/scan — scan pairs (signals only)
+/scan — scan pairs (tech + PDF)
 /signal `<PAIR>` — full signal
-/trade `<PAIR>` — open MT5 trade from signal
+/trade `<PAIR>` — open MT5 trade
+/pdftrade — trade best idea from loaded PDF
 /positions — open MT5 positions
 /closeall — close all MT5 positions
 /auto on|off — auto-trade every 15m
 /pairs — watched pairs
 
-_Real MT5 orders. Not financial advice._
+*PDF research*
+Send a *PDF file* (or /pdf + attach PDF)
+/pdfsignals — show ideas extracted from PDF
+/pdfclear — remove PDF ideas
+/pdfmode blend|pdf\\_priority|pdf\\_only — how PDF affects picks
+
+_Text PDFs work best (EURUSD BUY, SL, TP). Not financial advice._
 """.strip()
 
 
@@ -56,7 +71,6 @@ class ForexTelegramBot:
         raw_alert = env_str("TELEGRAM_ALERT_CHAT_ID", "")
         if raw_alert.isdigit():
             self.alert_chat_id = int(raw_alert)
-        # default alerts to first allowed user
         if self.alert_chat_id is None and self.allowed:
             self.alert_chat_id = next(iter(self.allowed))
 
@@ -73,13 +87,26 @@ class ForexTelegramBot:
             ("scan", self.cmd_scan),
             ("signal", self.cmd_signal),
             ("trade", self.cmd_trade),
+            ("pdftrade", self.cmd_pdftrade),
             ("positions", self.cmd_positions),
             ("closeall", self.cmd_closeall),
             ("auto", self.cmd_auto),
             ("pairs", self.cmd_pairs),
+            ("pdf", self.cmd_pdf_help),
+            ("pdfsignals", self.cmd_pdfsignals),
+            ("pdfclear", self.cmd_pdfclear),
+            ("pdfmode", self.cmd_pdfmode),
         ]
         for name, fn in handlers:
             self.app.add_handler(CommandHandler(name, fn))
+
+        # Accept PDF documents sent to the bot
+        self.app.add_handler(
+            MessageHandler(
+                filters.Document.PDF | filters.Document.MimeType("application/pdf"),
+                self.on_pdf_document,
+            )
+        )
 
         minutes = int(self.settings.get("scan_interval_minutes", 15))
         if self.app.job_queue is not None:
@@ -107,6 +134,9 @@ class ForexTelegramBot:
 
     async def _reply(self, update: Update, text: str) -> None:
         if update.message:
+            # Telegram message limit ~4096
+            if len(text) > 4000:
+                text = text[:3900] + "\n\n_(truncated)_"
             await update.message.reply_text(
                 text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
             )
@@ -116,6 +146,8 @@ class ForexTelegramBot:
         if chat_id is None:
             return
         try:
+            if len(text) > 4000:
+                text = text[:3900] + "\n\n_(truncated)_"
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=text,
@@ -131,10 +163,12 @@ class ForexTelegramBot:
         if update.effective_chat:
             self.alert_chat_id = update.effective_chat.id
         uid = update.effective_user.id if update.effective_user else "?"
+        pdf_n = len(self.agent.pdf_book.ideas) if self.agent.pdf_book else 0
         await self._reply(
             update,
             f"👋 MT5 Exness agent online.\n"
             f"Auto-trade 15m: `{'ON' if self.auto_enabled else 'OFF'}`\n"
+            f"PDF ideas loaded: `{pdf_n}`\n"
             f"Your ID: `{uid}`\n\n{HELP_TEXT}",
         )
 
@@ -148,10 +182,18 @@ class ForexTelegramBot:
             return
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         mins = self.settings.get("scan_interval_minutes", 15)
+        pdf_cfg = self.settings.get("pdf", {}) or {}
+        pdf_line = "PDF: `none`"
+        if self.agent.pdf_book and self.agent.pdf_book.ideas:
+            pdf_line = (
+                f"PDF: `{self.agent.pdf_book.source_name}` "
+                f"({len(self.agent.pdf_book.ideas)} ideas, mode=`{pdf_cfg.get('mode', 'blend')}`)"
+            )
         text = (
             f"*Status* @ `{now}`\n"
             f"Mode: `MT5 Exness`\n"
             f"Auto-trade: `{'ON' if self.auto_enabled else 'OFF'}` every `{mins}m`\n"
+            f"{pdf_line}\n"
             f"Pairs: `{', '.join(self.settings.get('pairs', []))}`\n\n"
             f"{self.broker.summary()}"
         )
@@ -202,17 +244,18 @@ class ForexTelegramBot:
     async def cmd_scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
-        await self._reply(update, "⏳ Scanning…")
+        await self._reply(update, "⏳ Scanning (tech + PDF)…")
         try:
             signals = self.agent.scan()
             min_score = int(self.settings.get("strategy", {}).get("min_score", 2))
-            lines = ["*Market scan*"]
+            lines = ["*Market scan* (tech + PDF)"]
             for s in signals:
                 mark = "✅" if s.is_actionable(min_score) else "·"
                 rsi_part = f" RSI={s.rsi:.1f}" if s.rsi is not None else ""
                 px_part = f" @ {s.price:.5f}" if s.price else ""
+                pdf_tag = " 📄" if any("PDF" in r for r in s.reasons) else ""
                 lines.append(
-                    f"{mark} `{s.pair}` {s.side.value} score={s.score}{px_part}{rsi_part}"
+                    f"{mark} `{s.pair}` {s.side.value} score={s.score}{px_part}{rsi_part}{pdf_tag}"
                 )
             await self._reply(update, "\n".join(lines))
         except Exception as exc:  # noqa: BLE001
@@ -241,6 +284,8 @@ class ForexTelegramBot:
         try:
             sig = self.agent.analyze_pair(pair)
             min_score = int(self.settings.get("strategy", {}).get("min_score", 2))
+            if self.agent.pdf_book and self.settings.get("pdf", {}).get("relax_min_score"):
+                min_score = max(1, min_score - 1)
             if not sig.is_actionable(min_score):
                 await self._reply(
                     update, f"No actionable signal for {pair}.\n\n{sig.pretty()}"
@@ -255,6 +300,41 @@ class ForexTelegramBot:
             )
         except Exception as exc:  # noqa: BLE001
             await self._reply(update, f"Trade failed: `{exc}`")
+
+    async def cmd_pdftrade(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Pick best PDF-backed signal and trade it on MT5."""
+        if not await self._auth(update):
+            return
+        if not self.agent.pdf_book or not self.agent.pdf_book.ideas:
+            await self._reply(update, "No PDF loaded. Send a PDF first, then `/pdftrade`.")
+            return
+        await self._reply(update, "⏳ Picking best PDF-backed trade…")
+        try:
+            signals = self.agent.actionable()
+            ranked = self.agent.rank_for_trade(signals)
+            pdf_pairs = {i.pair for i in self.agent.pdf_book.ideas}
+            # prefer PDF pairs; if none actionable, force-analyze PDF pairs
+            pick = next((s for s in ranked if s.pair in pdf_pairs), None)
+            if pick is None:
+                for idea in self.agent.pdf_book.ideas:
+                    sig = self.agent.analyze_pair(idea.pair)
+                    if sig.side.value != "FLAT":
+                        pick = sig
+                        break
+            if pick is None:
+                await self._reply(
+                    update,
+                    "No tradeable PDF idea right now.\n\n" + self.agent.pdf_book.summary(),
+                )
+                return
+            ok, msg, pos = self.broker.open_from_signal(pick)
+            extra = f"\n{pos.side} {pos.lots} @ {pos.entry}" if pos else ""
+            await self._reply(
+                update,
+                f"{'✅' if ok else '❌'} [PDF+MT5] {msg}{extra}\n\n{pick.pretty()}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            await self._reply(update, f"PDF trade failed: `{exc}`")
 
     async def cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
@@ -283,7 +363,7 @@ class ForexTelegramBot:
         await self._reply(
             update,
             f"Auto-trade: `{'ON' if self.auto_enabled else 'OFF'}` "
-            f"(every `{mins}` minutes, real MT5 orders)",
+            f"(every `{mins}` minutes, tech + PDF, real MT5 orders)",
         )
 
     async def cmd_pairs(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -291,6 +371,100 @@ class ForexTelegramBot:
             return
         pairs = self.settings.get("pairs", [])
         await self._reply(update, "*Watched pairs:*\n" + "\n".join(f"• `{p}`" for p in pairs))
+
+    async def cmd_pdf_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._auth(update):
+            return
+        await self._reply(
+            update,
+            "Send a *PDF file* in this chat (research / signal sheet).\n"
+            "I extract pairs like `EURUSD BUY` with optional SL/TP.\n\n"
+            "Then:\n"
+            "• `/pdfsignals` — show ideas\n"
+            "• `/pdftrade` — trade best PDF idea\n"
+            "• `/scan` — tech + PDF combined\n"
+            "• `/pdfmode blend` — default combine mode",
+        )
+
+    async def cmd_pdfsignals(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._auth(update):
+            return
+        book = self.agent.pdf_book or load_saved_book()
+        self.agent.pdf_book = book
+        if not book:
+            await self._reply(update, "No PDF loaded yet. Send a PDF file.")
+            return
+        await self._reply(update, book.summary())
+
+    async def cmd_pdfclear(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._auth(update):
+            return
+        clear_book()
+        self.agent.set_pdf_book(None)
+        await self._reply(update, "PDF ideas cleared. Tech-only signals until you upload again.")
+
+    async def cmd_pdfmode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._auth(update):
+            return
+        if not context.args or context.args[0].lower() not in {
+            "blend",
+            "pdf_priority",
+            "pdf_only",
+        }:
+            await self._reply(
+                update,
+                "Usage: `/pdfmode blend` | `/pdfmode pdf_priority` | `/pdfmode pdf_only`\n"
+                "• *blend* — tech + PDF boost when they agree\n"
+                "• *pdf\\_priority* — PDF direction wins\n"
+                "• *pdf\\_only* — only pairs mentioned in PDF",
+            )
+            return
+        mode = context.args[0].lower()
+        self.settings.setdefault("pdf", {})["mode"] = mode
+        self.agent.pdf_cfg = self.settings.get("pdf", {})
+        await self._reply(update, f"PDF mode set to `{mode}` (this session).")
+
+    async def on_pdf_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._auth(update):
+            return
+        doc = update.message.document if update.message else None
+        if doc is None:
+            return
+        name = (doc.file_name or "signal.pdf").lower()
+        mime = (doc.mime_type or "").lower()
+        if not (name.endswith(".pdf") or "pdf" in mime):
+            await self._reply(update, "Please send a *PDF* file.")
+            return
+
+        await self._reply(update, f"⏳ Reading PDF `{doc.file_name}`…")
+        try:
+            RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+            dest = RUNTIME_DIR / "last_upload.pdf"
+            tg_file = await context.bot.get_file(doc.file_id)
+            await tg_file.download_to_drive(custom_path=str(dest))
+
+            watched = list(self.settings.get("pairs", []))
+            book = load_pdf_book(dest, source_name=doc.file_name or "upload.pdf", watched=watched)
+            self.agent.set_pdf_book(book)
+
+            if not book.ideas:
+                await self._reply(
+                    update,
+                    f"PDF loaded (`{book.text_chars}` chars) but *no trade ideas* found.\n"
+                    "Tip: use text like `EURUSD BUY SL 1.08 TP 1.10`.\n"
+                    f"Preview: _{book.raw_preview[:200]}_",
+                )
+                return
+
+            await self._reply(
+                update,
+                f"✅ PDF loaded — `{len(book.ideas)}` idea(s)\n\n"
+                f"{book.summary()}\n\n"
+                "Use `/pdftrade` to open the best idea, or wait for the 15m auto cycle.",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("pdf upload failed")
+            await self._reply(update, f"❌ PDF failed: `{exc}`")
 
     def _quiet_hours(self) -> bool:
         qh = self.settings.get("quiet_hours") or {}
@@ -305,7 +479,7 @@ class ForexTelegramBot:
         return hour >= start or hour < end
 
     async def job_auto_trade(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Every 15 minutes: scan signals and open MT5 trades."""
+        """Every 15 minutes: scan tech+PDF and open MT5 trades."""
         if not self.auto_enabled:
             logger.info("Auto-trade skipped (disabled)")
             return
@@ -315,16 +489,16 @@ class ForexTelegramBot:
 
         place_orders = bool(self.settings.get("auto_trade_enabled", True))
         max_new = int(self.settings.get("max_new_trades_per_cycle", 1))
-        min_score = int(self.settings.get("strategy", {}).get("min_score", 2))
 
         try:
-            # keep MT5 session alive
+            self.agent.reload_pdf_book()
             self.broker.ensure()
 
-            signals = self.agent.actionable()
+            signals = self.agent.rank_for_trade(self.agent.actionable())
+            pdf_n = len(self.agent.pdf_book.ideas) if self.agent.pdf_book else 0
             lines = [
                 f"⏱ *15m auto cycle* @ `{datetime.now(timezone.utc).strftime('%H:%M UTC')}`",
-                f"Actionable signals: `{len(signals)}`",
+                f"Actionable: `{len(signals)}` | PDF ideas: `{pdf_n}`",
             ]
 
             if not signals:
@@ -333,7 +507,7 @@ class ForexTelegramBot:
                 return
 
             opened = 0
-            for sig in sorted(signals, key=lambda s: s.score, reverse=True):
+            for sig in signals:
                 lines.append(sig.pretty())
                 if not place_orders:
                     continue
@@ -355,7 +529,8 @@ class ForexTelegramBot:
 
     def run(self) -> None:
         logger.info(
-            "Starting Telegram bot | MT5 | auto=%s",
+            "Starting Telegram bot | MT5 | auto=%s | pdf=%s",
             self.auto_enabled,
+            bool(self.agent.pdf_book and self.agent.pdf_book.ideas),
         )
         self.app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)

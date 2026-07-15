@@ -40,6 +40,18 @@ auto_trade_on_start: true   # start auto trading without /auto on
 auto_trade_enabled: true    # place real MT5 orders (not alerts only)
 max_new_trades_per_cycle: 1 # open at most this many new positions each cycle
 
+# PDF research / signal sheets (upload via Telegram)
+pdf:
+  enabled: true
+  # blend = tech + PDF boost | pdf_priority = PDF direction wins | pdf_only = only PDF pairs
+  mode: blend
+  score_boost: 1              # points added when PDF agrees with tech
+  use_pdf_levels: true        # use SL/TP from PDF when present
+  allow_pdf_when_flat: true   # if tech is flat, still take PDF direction
+  block_on_conflict: false    # if true, skip when PDF and tech disagree
+  include_pdf_pairs: true     # scan pairs mentioned in PDF even if not in pairs list
+  relax_min_score: false      # if true, min_score - 1 when a PDF is loaded
+
 quiet_hours:
   start_hour_utc: null
   end_hour_utc: null

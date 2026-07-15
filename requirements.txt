@@ -6,3 +6,4 @@ pandas>=2.0.0
 numpy>=1.26.0
 requests>=2.31.0
 MetaTrader5>=5.0.45
+pypdf>=4.0.0

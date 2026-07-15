@@ -9,6 +9,7 @@ from typing import Any, Optional
 import pandas as pd
 
 from src.agent.indicators import atr, ema, macd, rsi
+from src.agent.pdf_signals import PdfSignalBook, PdfTradeIdea, load_saved_book
 from src.data.market_data import fetch_ohlc
 
 
@@ -57,17 +58,27 @@ class Signal:
 
 
 class ForexAgent:
-    """Score-based multi-indicator agent (EMA + RSI + MACD)."""
+    """Score-based multi-indicator agent (EMA + RSI + MACD) + optional PDF bias."""
 
     def __init__(self, settings: dict[str, Any]):
         self.settings = settings
         self.strat = settings.get("strategy", {})
         self.timeframe = settings.get("timeframe", "15m")
         self.period = settings.get("history_period", "5d")
+        self.pdf_cfg = settings.get("pdf", {}) or {}
+        self.pdf_book: Optional[PdfSignalBook] = load_saved_book()
+
+    def set_pdf_book(self, book: Optional[PdfSignalBook]) -> None:
+        self.pdf_book = book
+
+    def reload_pdf_book(self) -> Optional[PdfSignalBook]:
+        self.pdf_book = load_saved_book()
+        return self.pdf_book
 
     def analyze_pair(self, pair: str) -> Signal:
         df = fetch_ohlc(pair, interval=self.timeframe, period=self.period)
-        return self.analyze_df(pair, df)
+        sig = self.analyze_df(pair, df)
+        return self.apply_pdf_bias(sig)
 
     def analyze_df(self, pair: str, df: pd.DataFrame) -> Signal:
         s = self.strat
@@ -171,8 +182,100 @@ class ForexAgent:
             timeframe=self.timeframe,
         )
 
+    def apply_pdf_bias(self, signal: Signal) -> Signal:
+        """Merge PDF research ideas into technical signal."""
+        if not bool(self.pdf_cfg.get("enabled", True)):
+            return signal
+        if self.pdf_book is None or not self.pdf_book.ideas:
+            return signal
+
+        idea = self.pdf_book.by_pair(signal.pair)
+        mode = str(self.pdf_cfg.get("mode", "blend")).lower()  # blend | boost | pdf_priority
+        boost = int(self.pdf_cfg.get("score_boost", 1))
+
+        if idea is None:
+            if mode == "pdf_only":
+                signal.side = Side.FLAT
+                signal.score = 0
+                signal.confidence = 0.0
+                signal.reasons.append("PDF-only mode: no idea for this pair")
+            return signal
+
+        pdf_side = Side.BUY if idea.side.upper() == "BUY" else Side.SELL
+        signal.reasons.append(
+            f"PDF ({self.pdf_book.source_name}): {idea.side} "
+            f"— {idea.source_snippet[:80]}"
+        )
+
+        # Prefer PDF SL/TP when provided
+        if bool(self.pdf_cfg.get("use_pdf_levels", True)):
+            if idea.stop_loss is not None:
+                signal.stop_loss = idea.stop_loss
+            if idea.take_profit is not None:
+                signal.take_profit = idea.take_profit
+
+        if mode == "pdf_priority":
+            # PDF direction wins; keep price/ATR from market
+            signal.side = pdf_side
+            signal.score = max(signal.score, int(self.strat.get("min_score", 2)))
+            signal.confidence = max(signal.confidence, idea.confidence)
+            if signal.stop_loss is None and signal.atr:
+                mult_sl = float(self.strat.get("sl_atr_mult", 1.5))
+                mult_tp = float(self.strat.get("tp_atr_mult", 2.5))
+                if pdf_side == Side.BUY:
+                    signal.stop_loss = signal.price - signal.atr * mult_sl
+                    signal.take_profit = signal.price + signal.atr * mult_tp
+                else:
+                    signal.stop_loss = signal.price + signal.atr * mult_sl
+                    signal.take_profit = signal.price - signal.atr * mult_tp
+            return signal
+
+        # blend / boost: reinforce agreement, weaken conflict
+        if signal.side == pdf_side:
+            signal.score += boost
+            signal.confidence = min(1.0, signal.confidence + 0.15)
+            signal.reasons.append(f"PDF agrees — score +{boost}")
+        elif signal.side == Side.FLAT:
+            # allow PDF to open a light technical-flat trade if allowed
+            if bool(self.pdf_cfg.get("allow_pdf_when_flat", True)):
+                signal.side = pdf_side
+                signal.score = max(boost, int(self.strat.get("min_score", 2)) - 1)
+                signal.confidence = idea.confidence
+                signal.reasons.append("Tech flat — using PDF direction")
+                if signal.stop_loss is None and signal.atr:
+                    mult_sl = float(self.strat.get("sl_atr_mult", 1.5))
+                    mult_tp = float(self.strat.get("tp_atr_mult", 2.5))
+                    if pdf_side == Side.BUY:
+                        signal.stop_loss = signal.price - signal.atr * mult_sl
+                        signal.take_profit = signal.price + signal.atr * mult_tp
+                    else:
+                        signal.stop_loss = signal.price + signal.atr * mult_sl
+                        signal.take_profit = signal.price - signal.atr * mult_tp
+        else:
+            # conflict
+            if bool(self.pdf_cfg.get("block_on_conflict", False)):
+                signal.side = Side.FLAT
+                signal.score = 0
+                signal.confidence = 0.0
+                signal.reasons.append("PDF conflicts with tech — blocked")
+            else:
+                signal.score = max(0, signal.score - boost)
+                signal.reasons.append(f"PDF conflicts — score -{boost}")
+                if signal.score == 0:
+                    signal.side = Side.FLAT
+                    signal.confidence = 0.0
+
+        max_possible = 3 + boost
+        if signal.side != Side.FLAT:
+            signal.confidence = min(1.0, signal.score / max_possible)
+        return signal
+
     def scan(self, pairs: Optional[list[str]] = None) -> list[Signal]:
         pairs = pairs or list(self.settings.get("pairs", []))
+        # include PDF-only pairs not in default list
+        if self.pdf_book and bool(self.pdf_cfg.get("include_pdf_pairs", True)):
+            extra = [i.pair for i in self.pdf_book.ideas if i.pair not in pairs]
+            pairs = list(pairs) + extra
         results: list[Signal] = []
         for pair in pairs:
             try:
@@ -193,4 +296,21 @@ class ForexAgent:
 
     def actionable(self, pairs: Optional[list[str]] = None) -> list[Signal]:
         min_score = int(self.strat.get("min_score", 2))
-        return [s for s in self.scan(pairs) if s.is_actionable(min_score)]
+        # slightly lower bar when PDF is loaded and mode is soft
+        if self.pdf_book and self.pdf_book.ideas and bool(self.pdf_cfg.get("relax_min_score", False)):
+            min_score = max(1, min_score - 1)
+        sigs = [s for s in self.scan(pairs) if s.is_actionable(min_score)]
+        # prefer pairs that appear in PDF when ranking later
+        return sigs
+
+    def rank_for_trade(self, signals: list[Signal]) -> list[Signal]:
+        """Sort: PDF-backed first, then higher score."""
+        pdf_pairs = set()
+        if self.pdf_book:
+            pdf_pairs = {i.pair for i in self.pdf_book.ideas}
+
+        def key(s: Signal) -> tuple:
+            in_pdf = 1 if s.pair in pdf_pairs else 0
+            return (in_pdf, s.score, s.confidence)
+
+        return sorted(signals, key=key, reverse=True)

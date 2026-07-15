@@ -16,9 +16,10 @@ A **Telegram-linked forex trading agent** that:
 |--------|-------------|
 | Telegram commands | `/scan`, `/signal`, `/trade`, `/price`, `/positions`, … |
 | Strategy agent | EMA cross, RSI zones, MACD histogram score |
-| Paper broker | Persistent JSON ledger under `runtime/` |
-| Risk controls | Max positions, % risk per trade, daily loss cap |
-| Auto alerts | `/auto on` — periodic actionable signals + SL/TP checks |
+| PDF research | Upload a PDF; bot extracts pairs (BUY/SELL, SL/TP) and blends into picks |
+| MT5 / Exness | Live or demo orders via MetaTrader 5 |
+| Risk controls | Max positions, % risk per trade, lot clamps |
+| Auto trade | Every 15 minutes — tech + PDF ranked ideas |
 
 ## Project layout
 
