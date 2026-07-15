@@ -1,16 +1,17 @@
-# Forex Telegram Agent — MT5 / Exness settings
+# Conservative profile — fewer trades, stricter filters (after drawdown)
 
 pairs:
   - EURUSD
   - GBPUSD
   - USDJPY
   - AUDUSD
-  - USDCAD
-  - XAUUSD
+  # XAUUSD removed by default (very volatile); add back if you want gold
 
-# Signal timeframe (Yahoo for analysis; orders go to MT5)
 timeframe: "15m"
 history_period: "5d"
+# Higher timeframe trend filter
+htf_timeframe: "1h"
+htf_period: "60d"
 
 strategy:
   name: "multi_indicator"
@@ -22,42 +23,53 @@ strategy:
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9
-  min_score: 2
+  # Need strong agreement (was 2 → too many weak trades)
+  min_score: 3
   atr_period: 14
-  sl_atr_mult: 1.5
-  tp_atr_mult: 2.5
+  # Tighter SL, wider TP → aim ~1:2 reward/risk
+  sl_atr_mult: 1.2
+  tp_atr_mult: 2.4
+  # Quality gates
+  require_macd_momentum: true
+  require_ema_macd_agree: true
+  require_price_vs_ema_slow: true
+  block_buy_if_rsi_overbought: true
+  block_sell_if_rsi_oversold: true
+  htf_ema_fast: 20
+  htf_ema_slow: 50
 
 risk:
-  # 0 = unlimited open positions
-  max_open_positions: 0
-  risk_per_trade_pct: 1.0
-  # 0 = no daily loss lockout
-  max_daily_loss_pct: 0
-  # null / omit = no max lot cap (broker max only)
-  max_lot_size: null
+  # Cap concurrent exposure (was unlimited)
+  max_open_positions: 2
+  risk_per_trade_pct: 0.5
+  # Stop trading after floating loss ~3% of balance
+  max_daily_loss_pct: 3.0
+  max_lot_size: 0.05
   min_lot_size: 0.01
-  # Fixed lot for every trade (override % risk). Change in Telegram: "lot 0.05"
-  # null = use % risk sizing instead
+  # Keep small until edge is proven
   fixed_lot_size: 0.01
+  # Broker refuses weak signals even on manual "trade"
+  min_signal_score: 3
 
-# Auto trade every N minutes
 scan_interval_minutes: 15
 auto_trade_on_start: true
 auto_trade_enabled: true
-# 0 = unlimited new trades per 15m cycle (all actionable signals)
-max_new_trades_per_cycle: 0
+# Only 1 new auto trade per cycle (was unlimited)
+max_new_trades_per_cycle: 1
 
-# PDF research / signal sheets
 pdf:
   enabled: true
   mode: blend
   score_boost: 1
   use_pdf_levels: true
-  allow_pdf_when_flat: true
-  block_on_conflict: false
-  include_pdf_pairs: true
+  # Don't open weak PDF-only trades
+  allow_pdf_when_flat: false
+  block_on_conflict: true
+  include_pdf_pairs: false
   relax_min_score: false
 
+# Skip dead / choppy hours (UTC). Adjust for your session.
+# Example: avoid 21:00–01:00 UTC rollover noise
 quiet_hours:
-  start_hour_utc: null
-  end_hour_utc: null
+  start_hour_utc: 21
+  end_hour_utc: 1

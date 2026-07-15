@@ -301,10 +301,20 @@ class MT5Broker:
             return False, f"No tick/symbol info for {symbol}: {mt5.last_error()}", None
 
         price = tick.ask if signal.side == Side.BUY else tick.bid
+
+        # Approximate daily loss % from floating profit vs balance
+        bal = float(info["balance"]) or 1.0
+        daily_pnl_pct = (float(info["profit"]) / bal) * 100.0
+
+        # Minimum score gate from risk/strategy (broker-level safety)
+        min_score = int(self.risk_cfg.get("min_signal_score", 0) or 0)
+        if min_score and signal.score < min_score:
+            return False, f"Score {signal.score} < min {min_score} (quality filter)", None
+
         decision = check_trade(
             equity=float(info["equity"]),
             open_positions=len(self.open_positions()),
-            daily_pnl_pct=0.0,
+            daily_pnl_pct=daily_pnl_pct,
             entry=price,
             stop_loss=float(signal.stop_loss),
             pair=signal.pair,
