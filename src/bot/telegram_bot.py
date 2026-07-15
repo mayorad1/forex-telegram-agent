@@ -1,12 +1,13 @@
-"""Telegram interface — MT5 Exness trading agent + PDF + natural chat."""
+"""Interactive Telegram trading bot — chat, buttons, multi-step flows."""
 
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from telegram import Update
+from telegram import ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -18,22 +19,51 @@ from telegram.ext import (
 
 from src.agent.pdf_signals import clear_book, load_pdf_book, load_saved_book
 from src.agent.strategy import ForexAgent, Side, Signal
-from src.bot.chat_parser import CHAT_EXAMPLES, ChatIntent, parse_chat
+from src.bot.chat_parser import CHAT_EXAMPLES, ChatIntent, extract_pair, parse_chat
+from src.bot.keyboards import main_keyboard, pair_keyboard, yes_no_keyboard
+from src.bot.session import SessionStore
 from src.data.market_data import fetch_quote
 from src.trading.mt5_broker import MT5Broker
 from src.utils.config import RUNTIME_DIR, allowed_user_ids, env_str
 
 logger = logging.getLogger(__name__)
 
-HELP_TEXT = """
-*Forex Agent* — no slash needed. I detect your words.
+HELP_TEXT = (
+    """
+*🤖 Interactive Forex Agent*
 
-""" + CHAT_EXAMPLES + """
+Tap buttons below *or* type freely — I detect your command.
 
-*Slash still works:* /scan /trade /status /mt5 /auto
+"""
+    + CHAT_EXAMPLES
+    + """
+
+*Buttons* = one tap · *Chat* = type anything like `buy gold`
 
 _Not financial advice._
-""".strip()
+"""
+).strip()
+
+# Map keyboard button labels → synthetic chat text
+BUTTON_MAP = {
+    "📡 signals": "signals",
+    "⭐ best trade": "best trade",
+    "📂 positions": "positions",
+    "💰 status": "status",
+    "🟢 buy": "buy",
+    "🔴 sell": "sell",
+    "📋 pairs": "pairs",
+    "💲 price": "price",
+    "🤖 auto on": "auto on",
+    "⏸ auto off": "auto off",
+    "🔌 mt5": "mt5",
+    "📄 pdf": "pdf",
+    "🧹 close all": "close all",
+    "❓ help": "help",
+    "⬅️ menu": "menu",
+    "✅ yes": "yes",
+    "❌ no": "no",
+}
 
 
 class ForexTelegramBot:
@@ -52,6 +82,7 @@ class ForexTelegramBot:
         self.auto_enabled = bool(settings.get("auto_trade_on_start", True))
         self.mode = "mt5"
         self.alert_chat_id: Optional[int] = None
+        self.sessions = SessionStore()
         raw_alert = env_str("TELEGRAM_ALERT_CHAT_ID", "")
         if raw_alert.isdigit():
             self.alert_chat_id = int(raw_alert)
@@ -65,6 +96,7 @@ class ForexTelegramBot:
         handlers = [
             ("start", self.cmd_start),
             ("help", self.cmd_help),
+            ("menu", self.cmd_menu),
             ("status", self.cmd_status),
             ("mt5", self.cmd_mt5),
             ("price", self.cmd_price),
@@ -84,16 +116,21 @@ class ForexTelegramBot:
         for name, fn in handlers:
             self.app.add_handler(CommandHandler(name, fn))
 
-        # Accept PDF documents sent to the bot
         self.app.add_handler(
             MessageHandler(
                 filters.Document.PDF | filters.Document.MimeType("application/pdf"),
                 self.on_pdf_document,
             )
         )
-        # Natural language (no slash) — after commands so /foo still works
         self.app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_chat_text)
+        )
+        # Stickers / photos / voice — always reply interactively
+        self.app.add_handler(
+            MessageHandler(
+                filters.PHOTO | filters.VOICE | filters.Sticker.ALL | filters.VIDEO,
+                self.on_other_media,
+            )
         )
 
         minutes = int(self.settings.get("scan_interval_minutes", 15))
@@ -104,9 +141,10 @@ class ForexTelegramBot:
                 first=45,
                 name="auto_trade_15m",
             )
-            logger.info("Auto-trade job every %s minutes (first run in 45s)", minutes)
         else:
             logger.error("JobQueue missing — auto 15m trading will NOT run")
+
+    # ── helpers ──────────────────────────────────────────────
 
     async def _auth(self, update: Update) -> bool:
         user = update.effective_user
@@ -120,14 +158,25 @@ class ForexTelegramBot:
             return False
         return True
 
-    async def _reply(self, update: Update, text: str) -> None:
-        if update.message:
-            # Telegram message limit ~4096
-            if len(text) > 4000:
-                text = text[:3900] + "\n\n_(truncated)_"
-            await update.message.reply_text(
-                text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
-            )
+    def _uid(self, update: Update) -> int:
+        return update.effective_user.id if update.effective_user else 0
+
+    async def _reply(
+        self,
+        update: Update,
+        text: str,
+        keyboard: Optional[ReplyKeyboardMarkup] = None,
+    ) -> None:
+        if not update.message:
+            return
+        if len(text) > 4000:
+            text = text[:3900] + "\n\n_(truncated)_"
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+            reply_markup=keyboard if keyboard is not None else main_keyboard(),
+        )
 
     async def _notify(self, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
         chat_id = self.alert_chat_id
@@ -141,37 +190,195 @@ class ForexTelegramBot:
                 text=text,
                 parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True,
+                reply_markup=main_keyboard(),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("notify failed: %s", exc)
+
+    def _normalize_button(self, text: str) -> str:
+        t = text.strip()
+        key = t.lower()
+        if key in BUTTON_MAP:
+            return BUTTON_MAP[key]
+        # strip emoji prefix for matching
+        cleaned = re.sub(r"^[^\w]+", "", t).strip().lower()
+        if cleaned in BUTTON_MAP:
+            return BUTTON_MAP[cleaned]
+        # exact pair buttons
+        if re.fullmatch(r"[A-Za-z]{6}", t.replace("/", "")):
+            return t.upper().replace("/", "")
+        return t
+
+    # ── entry / menu ─────────────────────────────────────────
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
         if update.effective_chat:
             self.alert_chat_id = update.effective_chat.id
-        uid = update.effective_user.id if update.effective_user else "?"
+        sess = self.sessions.get(self._uid(update))
+        sess.clear_pending()
         pdf_n = len(self.agent.pdf_book.ideas) if self.agent.pdf_book else 0
         await self._reply(
             update,
-            f"👋 Ready. Just type messages like *signals* or *buy eurusd*.\n"
-            f"Auto-trade 15m: `{'ON' if self.auto_enabled else 'OFF'}`\n"
-            f"PDF ideas: `{pdf_n}` | ID: `{uid}`\n\n{HELP_TEXT}",
+            f"👋 *Hi!* I'm your interactive trading agent.\n\n"
+            f"• Tap a *button* below, or\n"
+            f"• Type anything: `signals`, `buy gold`, `status`…\n\n"
+            f"Auto 15m: `{'ON' if self.auto_enabled else 'OFF'}` · PDF ideas: `{pdf_n}`\n"
+            f"MT5: `{'connected' if self.broker.connected else 'try reconnect'}`\n\n"
+            f"What do you want to do?",
+            main_keyboard(),
         )
 
-    async def on_chat_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle plain English / casual commands without /."""
+    async def cmd_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
-        text = (update.message.text if update.message else "") or ""
+        self.sessions.get(self._uid(update)).clear_pending()
+        await self._reply(update, "📋 *Main menu* — tap a button or type a command.", main_keyboard())
+
+    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._auth(update):
+            return
+        await self._reply(update, HELP_TEXT, main_keyboard())
+
+    async def on_other_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._auth(update):
+            return
+        await self._reply(
+            update,
+            "I work with *text* and *PDF files*.\n"
+            "Try: `signals` · `buy eurusd` · or send a research PDF.\n"
+            "Or tap a button below 👇",
+            main_keyboard(),
+        )
+
+    # ── chat router ──────────────────────────────────────────
+
+    async def on_chat_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._auth(update):
+            return
+        raw = (update.message.text if update.message else "") or ""
+        text = self._normalize_button(raw)
+        uid = self._uid(update)
+        sess = self.sessions.get(uid)
+        sess.last_text = raw
+
+        # Menu cancel
+        if text.lower() in {"menu", "cancel", "stop", "nevermind", "never mind", "back"}:
+            sess.clear_pending()
+            await self._reply(update, "OK — back to menu. What next?", main_keyboard())
+            return
+
+        # Multi-step: waiting for pair
+        if sess.waiting == "pair":
+            await self._handle_pair_reply(update, context, sess, text)
+            return
+
+        # Multi-step: waiting for yes/no confirm
+        if sess.waiting == "confirm":
+            await self._handle_confirm_reply(update, context, sess, text)
+            return
+
+        # Bare pair while idle → show signal interactively
+        if re.fullmatch(r"[A-Za-z]{3,6}/?[A-Za-z]{0,3}", text.replace(" ", "")):
+            p = extract_pair(text)
+            if p and len(text.split()) == 1:
+                context.args = [p]
+                await self.cmd_signal(update, context)
+                return
+
         intent = parse_chat(text)
         if intent is None:
-            await self._reply(update, "Try `help` or `signals`.")
-            return
-        # Light feedback when we fuzzy-matched
-        if intent.matched and intent.name not in {"unknown", "help"}:
-            logger.info("chat intent=%s pair=%s side=%s matched=%r", intent.name, intent.pair, intent.side, intent.matched)
+            intent = ChatIntent("unknown", raw=raw, arg="`signals`, `buy eurusd`, `help`")
+
+        logger.info(
+            "chat user=%s intent=%s pair=%s side=%s matched=%r",
+            uid,
+            intent.name,
+            intent.pair,
+            intent.side,
+            intent.matched,
+        )
         await self._dispatch_intent(update, context, intent)
+
+    async def _handle_pair_reply(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        sess,
+        text: str,
+    ) -> None:
+        if text.lower() in {"menu", "cancel"}:
+            sess.clear_pending()
+            await self._reply(update, "Cancelled.", main_keyboard())
+            return
+        pair = extract_pair(text) or (
+            text.upper().replace("/", "") if re.fullmatch(r"[A-Za-z]{6}", text.replace("/", "")) else None
+        )
+        if not pair:
+            await self._reply(
+                update,
+                f"Still need a *pair* for `{sess.pending_action}`.\n"
+                "Tap one below or type e.g. `EURUSD` / `gold`.",
+                pair_keyboard(),
+            )
+            return
+
+        action = sess.pending_action
+        side = sess.pending_side
+        sess.clear_pending()
+
+        if action in {"force_buy", "force_sell", "force_trade"}:
+            await self._force_trade(update, pair, side or "BUY")
+        elif action == "trade":
+            context.args = [pair]
+            await self.cmd_trade(update, context)
+        elif action == "price":
+            context.args = [pair]
+            await self.cmd_price(update, context)
+        elif action == "signal":
+            context.args = [pair]
+            await self.cmd_signal(update, context)
+        elif action == "close_pair":
+            await self._close_pair(update, pair)
+        else:
+            context.args = [pair]
+            await self.cmd_signal(update, context)
+
+    async def _handle_confirm_reply(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        sess,
+        text: str,
+    ) -> None:
+        low = text.lower().strip()
+        yes = low in {"yes", "y", "ok", "okay", "✅ yes", "confirm", "do it", "go", "sure"}
+        no = low in {"no", "n", "nope", "❌ no", "cancel", "stop"}
+        if no:
+            sess.clear_pending()
+            await self._reply(update, "Cancelled. Nothing opened.", main_keyboard())
+            return
+        if not yes:
+            await self._reply(
+                update,
+                f"Confirm *{sess.pending_side or sess.pending_action}* "
+                f"`{sess.pending_pair}`? Tap Yes or No.",
+                yes_no_keyboard(),
+            )
+            return
+        pair = sess.pending_pair
+        side = sess.pending_side
+        action = sess.pending_action
+        sess.clear_pending()
+        if action == "force_trade" and pair and side:
+            await self._force_trade(update, pair, side)
+        elif action == "best_trade":
+            await self._best_trade(update, skip_confirm=True)
+        elif action == "closeall":
+            await self.cmd_closeall(update, context)
+        else:
+            await self._reply(update, "Done.", main_keyboard())
 
     async def _dispatch_intent(
         self,
@@ -179,39 +386,73 @@ class ForexTelegramBot:
         context: ContextTypes.DEFAULT_TYPE,
         intent: ChatIntent,
     ) -> None:
+        sess = self.sessions.get(self._uid(update))
         name = intent.name
+
         if name == "help":
             await self.cmd_help(update, context)
         elif name == "unknown":
-            pair_hint = f"\nI saw pair `{intent.pair}`." if intent.pair else ""
             await self._reply(
                 update,
-                f"Not sure what you mean by _{intent.raw[:80]}_.\n"
-                f"Did you mean: {intent.arg}?{pair_hint}\n\n"
-                "Examples: `signals` · `buy eurusd` · `positions` · `help`",
+                f"🤔 I heard: _{intent.raw[:100]}_\n"
+                f"Did you mean: {intent.arg}?\n\n"
+                "Or tap a button 👇",
+                main_keyboard(),
             )
         elif name == "scan":
             await self.cmd_scan(update, context)
-        elif name == "signal" and intent.pair:
-            context.args = [intent.pair]
-            await self.cmd_signal(update, context)
-        elif name == "price" and intent.pair:
-            context.args = [intent.pair]
-            await self.cmd_price(update, context)
-        elif name == "trade" and intent.pair:
-            context.args = [intent.pair]
-            await self.cmd_trade(update, context)
-        elif name == "force_trade" and intent.pair and intent.side:
-            await self._force_trade(update, intent.pair, intent.side)
-        elif name == "best_trade":
-            await self._best_trade(update)
+        elif name == "signal":
+            if intent.pair:
+                context.args = [intent.pair]
+                await self.cmd_signal(update, context)
+            else:
+                sess.ask_pair("signal")
+                await self._reply(
+                    update,
+                    "Which pair do you want a *signal* for?",
+                    pair_keyboard(),
+                )
+        elif name == "price":
+            if intent.pair:
+                context.args = [intent.pair]
+                await self.cmd_price(update, context)
+            else:
+                sess.ask_pair("price")
+                await self._reply(update, "Price for which *pair*?", pair_keyboard())
+        elif name == "trade":
+            if intent.pair:
+                context.args = [intent.pair]
+                await self.cmd_trade(update, context)
+            else:
+                sess.ask_pair("trade")
+                await self._reply(update, "Trade which *pair* (strategy)?", pair_keyboard())
+        elif name == "force_trade":
+            if intent.pair and intent.side:
+                # Ask confirm for safety on interactive force trade
+                sess.ask_confirm("force_trade", intent.pair, intent.side)
+                await self._reply(
+                    update,
+                    f"Confirm *{intent.side}* on `{intent.pair}` on MT5?\n"
+                    "Tap *Yes* to open, *No* to cancel.",
+                    yes_no_keyboard(),
+                )
+            else:
+                sess.ask_pair("force_trade", intent.side or "BUY")
+                await self._reply(
+                    update,
+                    f"*{intent.side or 'BUY'}* which pair?",
+                    pair_keyboard(),
+                )
         elif name == "need_pair":
-            action = intent.side or intent.arg or "use"
+            action = "force_trade" if intent.side else (intent.arg or "signal")
+            sess.ask_pair(action, intent.side)
             await self._reply(
                 update,
-                f"Which pair? e.g. `{action} eurusd` or `{action} gold`\n"
-                "Pairs: eurusd, gbpusd, usdjpy, gold, audusd, usdcad…",
+                f"Which pair for *{intent.side or action}*? Tap below or type it.",
+                pair_keyboard(),
             )
+        elif name == "best_trade":
+            await self._best_trade(update)
         elif name == "positions":
             await self.cmd_positions(update, context)
         elif name == "status":
@@ -219,9 +460,18 @@ class ForexTelegramBot:
         elif name == "pairs":
             await self.cmd_pairs(update, context)
         elif name == "closeall":
-            await self.cmd_closeall(update, context)
-        elif name == "close_pair" and intent.pair:
-            await self._close_pair(update, intent.pair)
+            sess.ask_confirm("closeall", "", None)
+            await self._reply(
+                update,
+                "⚠️ Close *ALL* open MT5 positions?\nTap *Yes* or *No*.",
+                yes_no_keyboard(),
+            )
+        elif name == "close_pair":
+            if intent.pair:
+                await self._close_pair(update, intent.pair)
+            else:
+                sess.ask_pair("close_pair")
+                await self._reply(update, "Close which pair?", pair_keyboard())
         elif name == "auto" and intent.arg:
             context.args = [intent.arg]
             await self.cmd_auto(update, context)
@@ -236,37 +486,17 @@ class ForexTelegramBot:
         elif name == "pdf_help":
             await self.cmd_pdf_help(update, context)
         else:
-            await self._reply(update, "Try `help` for examples.")
-
-    async def _best_trade(self, update: Update) -> None:
-        """Scan and open the single best actionable signal."""
-        await self._reply(update, "⏳ Finding best setup…")
-        try:
-            signals = self.agent.rank_for_trade(self.agent.actionable())
-            if not signals:
-                # show scan summary even if none actionable
-                all_sigs = self.agent.scan()
-                lines = ["No strong setup right now.\n*Latest scores:*"]
-                for s in sorted(all_sigs, key=lambda x: x.score, reverse=True)[:6]:
-                    lines.append(f"• `{s.pair}` {s.side.value} score={s.score}")
-                lines.append("\nTry `signals` for full detail.")
-                await self._reply(update, "\n".join(lines))
-                return
-            pick = signals[0]
-            ok, msg, pos = self.broker.open_from_signal(pick)
-            extra = f"\n{pos.side} {pos.lots} @ {pos.entry}" if pos else ""
             await self._reply(
                 update,
-                f"{'✅' if ok else '❌'} *Best pick* `{pick.pair}`\n{msg}{extra}\n\n{pick.pretty()}",
+                "I'm here! Try `signals`, `buy eurusd`, or tap a button.",
+                main_keyboard(),
             )
-        except Exception as exc:  # noqa: BLE001
-            await self._reply(update, f"Best trade failed: `{exc}`")
+
+    # ── trading actions ──────────────────────────────────────
 
     async def _force_trade(self, update: Update, pair: str, side: str) -> None:
-        """Open MT5 trade on request (buy/sell for pair), with tech SL/TP if possible."""
-        await self._reply(update, f"⏳ Opening *{side}* on `{pair}`…")
+        await self._reply(update, f"⏳ Opening *{side}* `{pair}` on MT5…", main_keyboard())
         try:
-            # Build signal from market analysis but force user side
             try:
                 sig = self.agent.analyze_pair(pair)
             except Exception:  # noqa: BLE001
@@ -277,28 +507,26 @@ class ForexTelegramBot:
                     price=q.price,
                     score=2,
                     confidence=0.5,
-                    reasons=[f"Manual {side} request"],
+                    reasons=[f"Manual {side}"],
                     timeframe="manual",
                 )
-            # force direction
             forced = Side.BUY if side == "BUY" else Side.SELL
-            if sig.side != forced or sig.stop_loss is None:
-                # rebuild SL/TP for forced side using ATR if available
-                price = sig.price or fetch_quote(pair).price
-                atr = sig.atr or (price * 0.001)
-                sl_m = float(self.settings.get("strategy", {}).get("sl_atr_mult", 1.5))
-                tp_m = float(self.settings.get("strategy", {}).get("tp_atr_mult", 2.5))
-                if forced == Side.BUY:
-                    sl, tp = price - atr * sl_m, price + atr * tp_m
-                else:
-                    sl, tp = price + atr * sl_m, price - atr * tp_m
+            price = sig.price or fetch_quote(pair).price
+            atr = sig.atr or (price * 0.001)
+            sl_m = float(self.settings.get("strategy", {}).get("sl_atr_mult", 1.5))
+            tp_m = float(self.settings.get("strategy", {}).get("tp_atr_mult", 2.5))
+            if forced == Side.BUY:
+                sl, tp = price - atr * sl_m, price + atr * tp_m
+            else:
+                sl, tp = price + atr * sl_m, price - atr * tp_m
+            if sig.stop_loss is None or sig.side != forced:
                 sig = Signal(
                     pair=pair,
                     side=forced,
                     price=price,
                     score=max(sig.score, 2),
                     confidence=max(sig.confidence, 0.5),
-                    reasons=list(sig.reasons) + [f"Manual chat: {side} {pair}"],
+                    reasons=list(sig.reasons) + [f"Interactive: {side} {pair}"],
                     stop_loss=sl,
                     take_profit=tp,
                     atr=atr,
@@ -307,16 +535,37 @@ class ForexTelegramBot:
                 )
             else:
                 sig.side = forced
-                sig.reasons.append(f"Manual chat: {side} {pair}")
-
             ok, msg, pos = self.broker.open_from_signal(sig)
-            extra = f"\n{pos.side} {pos.lots} {pos.pair} @ {pos.entry}" if pos else ""
+            extra = f"\n{pos.side} {pos.lots} lots @ {pos.entry}" if pos else ""
             await self._reply(
                 update,
                 f"{'✅' if ok else '❌'} {msg}{extra}\n\n{sig.pretty()}",
+                main_keyboard(),
             )
         except Exception as exc:  # noqa: BLE001
-            await self._reply(update, f"Trade failed: `{exc}`")
+            await self._reply(update, f"❌ Trade failed: `{exc}`", main_keyboard())
+
+    async def _best_trade(self, update: Update, skip_confirm: bool = True) -> None:
+        await self._reply(update, "⏳ Scanning for best setup…", main_keyboard())
+        try:
+            signals = self.agent.rank_for_trade(self.agent.actionable())
+            if not signals:
+                all_sigs = self.agent.scan()
+                lines = ["No strong setup right now.\n*Scores:*"]
+                for s in sorted(all_sigs, key=lambda x: x.score, reverse=True)[:6]:
+                    lines.append(f"• `{s.pair}` {s.side.value} score={s.score}")
+                await self._reply(update, "\n".join(lines), main_keyboard())
+                return
+            pick = signals[0]
+            ok, msg, pos = self.broker.open_from_signal(pick)
+            extra = f"\n{pos.side} {pos.lots} @ {pos.entry}" if pos else ""
+            await self._reply(
+                update,
+                f"{'✅' if ok else '❌'} *Best pick* `{pick.pair}`\n{msg}{extra}\n\n{pick.pretty()}",
+                main_keyboard(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            await self._reply(update, f"❌ `{exc}`", main_keyboard())
 
     async def _close_pair(self, update: Update, pair: str) -> None:
         try:
@@ -325,51 +574,50 @@ class ForexTelegramBot:
 
             positions = mt5.positions_get()
             if not positions:
-                await self._reply(update, "No open positions.")
+                await self._reply(update, "No open positions.", main_keyboard())
                 return
             target = pair.upper().replace("/", "")
             closed = []
             for p in positions:
-                sym = p.symbol.upper().replace(".", "").replace("M", "")
-                if target in p.symbol.upper().replace("/", "") or target in sym:
-                    # close via broker close_all filtered — reuse order_send path
-                    tick = mt5.symbol_info_tick(p.symbol)
-                    if tick is None:
-                        closed.append(f"No tick for {p.symbol}")
+                if target not in p.symbol.upper().replace("/", "").replace(".", ""):
+                    # loose match
+                    if target[:6] not in p.symbol.upper().replace("M", ""):
                         continue
-                    if p.type == mt5.POSITION_TYPE_BUY:
-                        otype, price = mt5.ORDER_TYPE_SELL, tick.bid
-                    else:
-                        otype, price = mt5.ORDER_TYPE_BUY, tick.ask
-                    req = {
-                        "action": mt5.TRADE_ACTION_DEAL,
-                        "symbol": p.symbol,
-                        "volume": p.volume,
-                        "type": otype,
-                        "position": p.ticket,
-                        "price": price,
-                        "deviation": 30,
-                        "magic": self.broker.MAGIC,
-                        "comment": "chat close",
-                        "type_time": mt5.ORDER_TIME_GTC,
-                        "type_filling": self.broker._filling_mode(p.symbol),
-                    }
-                    r = mt5.order_send(req)
-                    if r and r.retcode == mt5.TRADE_RETCODE_DONE:
-                        closed.append(f"Closed {p.symbol} #{p.ticket}")
-                    else:
-                        closed.append(f"Fail {p.symbol}: {getattr(r, 'comment', r)}")
-            if not closed:
-                await self._reply(update, f"No open position matching `{pair}`.")
-            else:
-                await self._reply(update, "\n".join(closed))
+                tick = mt5.symbol_info_tick(p.symbol)
+                if tick is None:
+                    closed.append(f"No tick {p.symbol}")
+                    continue
+                if p.type == mt5.POSITION_TYPE_BUY:
+                    otype, price = mt5.ORDER_TYPE_SELL, tick.bid
+                else:
+                    otype, price = mt5.ORDER_TYPE_BUY, tick.ask
+                req = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": p.symbol,
+                    "volume": p.volume,
+                    "type": otype,
+                    "position": p.ticket,
+                    "price": price,
+                    "deviation": 30,
+                    "magic": self.broker.MAGIC,
+                    "comment": "interactive close",
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": self.broker._filling_mode(p.symbol),
+                }
+                r = mt5.order_send(req)
+                if r and r.retcode == mt5.TRADE_RETCODE_DONE:
+                    closed.append(f"✅ Closed {p.symbol} #{p.ticket}")
+                else:
+                    closed.append(f"❌ {p.symbol}: {getattr(r, 'comment', r)}")
+            await self._reply(
+                update,
+                "\n".join(closed) if closed else f"No position matching `{pair}`.",
+                main_keyboard(),
+            )
         except Exception as exc:  # noqa: BLE001
-            await self._reply(update, f"Close failed: `{exc}`")
+            await self._reply(update, f"❌ `{exc}`", main_keyboard())
 
-    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._auth(update):
-            return
-        await self._reply(update, HELP_TEXT)
+    # ── slash / shared commands ──────────────────────────────
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
@@ -381,133 +629,146 @@ class ForexTelegramBot:
         if self.agent.pdf_book and self.agent.pdf_book.ideas:
             pdf_line = (
                 f"PDF: `{self.agent.pdf_book.source_name}` "
-                f"({len(self.agent.pdf_book.ideas)} ideas, mode=`{pdf_cfg.get('mode', 'blend')}`)"
+                f"({len(self.agent.pdf_book.ideas)} ideas, `{pdf_cfg.get('mode', 'blend')}`)"
             )
         text = (
             f"*Status* @ `{now}`\n"
             f"Mode: `MT5 Exness`\n"
             f"Auto-trade: `{'ON' if self.auto_enabled else 'OFF'}` every `{mins}m`\n"
+            f"MT5: `{'✅ connected' if self.broker.connected else '❌ disconnected'}`\n"
             f"{pdf_line}\n"
             f"Pairs: `{', '.join(self.settings.get('pairs', []))}`\n\n"
             f"{self.broker.summary()}"
         )
-        await self._reply(update, text)
+        await self._reply(update, text, main_keyboard())
 
     async def cmd_mt5(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
-        await self._reply(update, "⏳ Reconnecting to MT5…")
+        await self._reply(update, "⏳ Reconnecting MT5…", main_keyboard())
         try:
             self.broker.disconnect()
             ok, msg = self.broker.connect(retries=5)
-            if ok:
-                await self._reply(update, f"✅ {msg}\n\n{self.broker.summary()}")
-            else:
-                await self._reply(
-                    update,
-                    f"❌ {msg}\n\n"
-                    "Keep MT5 open on Exness, turn *Algo Trading* ON, free RAM, then `/mt5` again.",
-                )
+            await self._reply(
+                update,
+                (f"✅ {msg}\n\n{self.broker.summary()}" if ok else f"❌ {msg}"),
+                main_keyboard(),
+            )
         except Exception as exc:  # noqa: BLE001
-            await self._reply(update, f"❌ MT5 error: `{exc}`")
+            await self._reply(update, f"❌ `{exc}`", main_keyboard())
 
     async def cmd_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
         if not context.args:
-            await self._reply(update, "Usage: `/price EURUSD`")
+            self.sessions.get(self._uid(update)).ask_pair("price")
+            await self._reply(update, "Price for which pair?", pair_keyboard())
             return
         pair = context.args[0].upper().replace("/", "")
         try:
             if self.broker.connected:
-                sym = self.broker.resolve_symbol(pair)
-                import MetaTrader5 as mt5
+                try:
+                    sym = self.broker.resolve_symbol(pair)
+                    import MetaTrader5 as mt5
 
-                tick = mt5.symbol_info_tick(sym)
-                if tick:
-                    await self._reply(
-                        update, f"*{sym}* (MT5)\nBid: `{tick.bid}` Ask: `{tick.ask}`"
-                    )
-                    return
+                    tick = mt5.symbol_info_tick(sym)
+                    if tick:
+                        await self._reply(
+                            update,
+                            f"*{sym}*\nBid: `{tick.bid}`\nAsk: `{tick.ask}`",
+                            main_keyboard(),
+                        )
+                        return
+                except Exception:  # noqa: BLE001
+                    pass
             q = fetch_quote(pair)
             ch = f" ({q.change_pct:+.3f}%)" if q.change_pct is not None else ""
-            await self._reply(update, f"*{q.pair}*: `{q.price:.5f}`{ch}")
+            await self._reply(update, f"*{q.pair}*: `{q.price:.5f}`{ch}", main_keyboard())
         except Exception as exc:  # noqa: BLE001
-            await self._reply(update, f"Failed: `{exc}`")
+            await self._reply(update, f"❌ `{exc}`", main_keyboard())
 
     async def cmd_scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
-        await self._reply(update, "⏳ Scanning (tech + PDF)…")
+        await self._reply(update, "⏳ Scanning markets…", main_keyboard())
         try:
             signals = self.agent.scan()
             min_score = int(self.settings.get("strategy", {}).get("min_score", 2))
-            lines = ["*Market scan* (tech + PDF)"]
+            lines = ["*📡 Market signals*\n"]
             for s in signals:
                 mark = "✅" if s.is_actionable(min_score) else "·"
                 rsi_part = f" RSI={s.rsi:.1f}" if s.rsi is not None else ""
-                px_part = f" @ {s.price:.5f}" if s.price else ""
-                pdf_tag = " 📄" if any("PDF" in r for r in s.reasons) else ""
+                px = f" @ {s.price:.5f}" if s.price else ""
+                pdf = " 📄" if any("PDF" in r for r in s.reasons) else ""
                 lines.append(
-                    f"{mark} `{s.pair}` {s.side.value} score={s.score}{px_part}{rsi_part}{pdf_tag}"
+                    f"{mark} `{s.pair}` *{s.side.value}* score=`{s.score}`{px}{rsi_part}{pdf}"
                 )
-            await self._reply(update, "\n".join(lines))
+            lines.append("\n_Tap a pair name or type `buy eurusd` / `check gold`_")
+            await self._reply(update, "\n".join(lines), main_keyboard())
         except Exception as exc:  # noqa: BLE001
-            await self._reply(update, f"Scan failed: `{exc}`")
+            await self._reply(update, f"❌ Scan failed: `{exc}`", main_keyboard())
 
     async def cmd_signal(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
         if not context.args:
-            await self._reply(update, "Usage: `/signal EURUSD`")
+            self.sessions.get(self._uid(update)).ask_pair("signal")
+            await self._reply(update, "Signal for which pair?", pair_keyboard())
             return
         pair = context.args[0].upper().replace("/", "")
         try:
             sig = self.agent.analyze_pair(pair)
-            await self._reply(update, sig.pretty())
+            tip = ""
+            if sig.side.value in {"BUY", "SELL"}:
+                tip = f"\n\nReply `buy {pair.lower()}` or `sell {pair.lower()}` to open."
+            await self._reply(update, sig.pretty() + tip, main_keyboard())
         except Exception as exc:  # noqa: BLE001
-            await self._reply(update, f"Failed: `{exc}`")
+            await self._reply(update, f"❌ `{exc}`", main_keyboard())
 
     async def cmd_trade(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
         if not context.args:
-            await self._reply(update, "Usage: `/trade EURUSD`")
+            self.sessions.get(self._uid(update)).ask_pair("trade")
+            await self._reply(update, "Trade which pair?", pair_keyboard())
             return
         pair = context.args[0].upper().replace("/", "")
         try:
             sig = self.agent.analyze_pair(pair)
             min_score = int(self.settings.get("strategy", {}).get("min_score", 2))
-            if self.agent.pdf_book and self.settings.get("pdf", {}).get("relax_min_score"):
-                min_score = max(1, min_score - 1)
             if not sig.is_actionable(min_score):
                 await self._reply(
-                    update, f"No actionable signal for {pair}.\n\n{sig.pretty()}"
+                    update,
+                    f"No strong signal for `{pair}` yet.\n\n{sig.pretty()}\n\n"
+                    f"Force it with `buy {pair.lower()}` or `sell {pair.lower()}`.",
+                    main_keyboard(),
                 )
                 return
             ok, msg, pos = self.broker.open_from_signal(sig)
-            extra = ""
-            if pos is not None:
-                extra = f"\n{pos.side} {pos.lots} {pos.pair} @ {pos.entry}"
+            extra = f"\n{pos.side} {pos.lots} @ {pos.entry}" if pos else ""
             await self._reply(
-                update, f"{'✅' if ok else '❌'} [MT5] {msg}{extra}\n\n{sig.pretty()}"
+                update,
+                f"{'✅' if ok else '❌'} {msg}{extra}\n\n{sig.pretty()}",
+                main_keyboard(),
             )
         except Exception as exc:  # noqa: BLE001
-            await self._reply(update, f"Trade failed: `{exc}`")
+            await self._reply(update, f"❌ `{exc}`", main_keyboard())
 
     async def cmd_pdftrade(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Pick best PDF-backed signal and trade it on MT5."""
         if not await self._auth(update):
             return
         if not self.agent.pdf_book or not self.agent.pdf_book.ideas:
-            await self._reply(update, "No PDF loaded. Send a PDF first, then `/pdftrade`.")
+            await self._reply(
+                update,
+                "No PDF loaded. Send a *PDF file* in chat first.",
+                main_keyboard(),
+            )
             return
-        await self._reply(update, "⏳ Picking best PDF-backed trade…")
+        await self._reply(update, "⏳ Best PDF idea…", main_keyboard())
         try:
             signals = self.agent.actionable()
             ranked = self.agent.rank_for_trade(signals)
             pdf_pairs = {i.pair for i in self.agent.pdf_book.ideas}
-            # prefer PDF pairs; if none actionable, force-analyze PDF pairs
             pick = next((s for s in ranked if s.pair in pdf_pairs), None)
             if pick is None:
                 for idea in self.agent.pdf_book.ideas:
@@ -518,37 +779,44 @@ class ForexTelegramBot:
             if pick is None:
                 await self._reply(
                     update,
-                    "No tradeable PDF idea right now.\n\n" + self.agent.pdf_book.summary(),
+                    "No tradeable PDF idea now.\n\n" + self.agent.pdf_book.summary(),
+                    main_keyboard(),
                 )
                 return
             ok, msg, pos = self.broker.open_from_signal(pick)
             extra = f"\n{pos.side} {pos.lots} @ {pos.entry}" if pos else ""
             await self._reply(
                 update,
-                f"{'✅' if ok else '❌'} [PDF+MT5] {msg}{extra}\n\n{pick.pretty()}",
+                f"{'✅' if ok else '❌'} [PDF] {msg}{extra}\n\n{pick.pretty()}",
+                main_keyboard(),
             )
         except Exception as exc:  # noqa: BLE001
-            await self._reply(update, f"PDF trade failed: `{exc}`")
+            await self._reply(update, f"❌ `{exc}`", main_keyboard())
 
     async def cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
-        await self._reply(update, self.broker.summary())
+        await self._reply(update, self.broker.summary(), main_keyboard())
 
     async def cmd_closeall(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
+        # If already confirmed via session, pending cleared by caller path
         try:
             msgs = self.broker.close_all()
-            await self._reply(update, "\n".join(msgs) if msgs else "No open positions.")
+            await self._reply(
+                update,
+                "\n".join(msgs) if msgs else "No open positions.",
+                main_keyboard(),
+            )
         except Exception as exc:  # noqa: BLE001
-            await self._reply(update, f"Close failed: `{exc}`")
+            await self._reply(update, f"❌ `{exc}`", main_keyboard())
 
     async def cmd_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
         if not context.args or context.args[0].lower() not in {"on", "off"}:
-            await self._reply(update, "Usage: `/auto on` or `/auto off`")
+            await self._reply(update, "Say `auto on` or `auto off`.", main_keyboard())
             return
         self.auto_enabled = context.args[0].lower() == "on"
         if update.effective_chat:
@@ -556,28 +824,33 @@ class ForexTelegramBot:
         mins = self.settings.get("scan_interval_minutes", 15)
         await self._reply(
             update,
-            f"Auto-trade: `{'ON' if self.auto_enabled else 'OFF'}` "
-            f"(every `{mins}` minutes, tech + PDF, real MT5 orders)",
+            f"Auto-trade: *{'ON' if self.auto_enabled else 'OFF'}* (every {mins}m)",
+            main_keyboard(),
         )
 
     async def cmd_pairs(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
         pairs = self.settings.get("pairs", [])
-        await self._reply(update, "*Watched pairs:*\n" + "\n".join(f"• `{p}`" for p in pairs))
+        await self._reply(
+            update,
+            "*Watchlist:*\n"
+            + "\n".join(f"• `{p}`" for p in pairs)
+            + "\n\nTap a pair button or type its name for a signal.",
+            pair_keyboard(),
+        )
 
     async def cmd_pdf_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
         await self._reply(
             update,
-            "Send a *PDF file* in this chat (research / signal sheet).\n"
-            "I extract pairs like `EURUSD BUY` with optional SL/TP.\n\n"
-            "Then:\n"
-            "• `/pdfsignals` — show ideas\n"
-            "• `/pdftrade` — trade best PDF idea\n"
-            "• `/scan` — tech + PDF combined\n"
-            "• `/pdfmode blend` — default combine mode",
+            "📄 *PDF mode*\n"
+            "1. Send a PDF file here\n"
+            "2. I extract BUY/SELL ideas\n"
+            "3. Say `pdf signals` or `pdf trade`\n\n"
+            "Best format: `EURUSD BUY SL 1.08 TP 1.10`",
+            main_keyboard(),
         )
 
     async def cmd_pdfsignals(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -586,16 +859,16 @@ class ForexTelegramBot:
         book = self.agent.pdf_book or load_saved_book()
         self.agent.pdf_book = book
         if not book:
-            await self._reply(update, "No PDF loaded yet. Send a PDF file.")
+            await self._reply(update, "No PDF loaded. Send a PDF file.", main_keyboard())
             return
-        await self._reply(update, book.summary())
+        await self._reply(update, book.summary(), main_keyboard())
 
     async def cmd_pdfclear(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
         clear_book()
         self.agent.set_pdf_book(None)
-        await self._reply(update, "PDF ideas cleared. Tech-only signals until you upload again.")
+        await self._reply(update, "PDF ideas cleared.", main_keyboard())
 
     async def cmd_pdfmode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
@@ -607,16 +880,15 @@ class ForexTelegramBot:
         }:
             await self._reply(
                 update,
-                "Usage: `/pdfmode blend` | `/pdfmode pdf_priority` | `/pdfmode pdf_only`\n"
-                "• *blend* — tech + PDF boost when they agree\n"
-                "• *pdf\\_priority* — PDF direction wins\n"
-                "• *pdf\\_only* — only pairs mentioned in PDF",
+                "Modes: `blend` · `pdf_priority` · `pdf_only`\n"
+                "Example: type later via config; default is blend.",
+                main_keyboard(),
             )
             return
         mode = context.args[0].lower()
         self.settings.setdefault("pdf", {})["mode"] = mode
         self.agent.pdf_cfg = self.settings.get("pdf", {})
-        await self._reply(update, f"PDF mode set to `{mode}` (this session).")
+        await self._reply(update, f"PDF mode: `{mode}`", main_keyboard())
 
     async def on_pdf_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
@@ -627,43 +899,41 @@ class ForexTelegramBot:
         name = (doc.file_name or "signal.pdf").lower()
         mime = (doc.mime_type or "").lower()
         if not (name.endswith(".pdf") or "pdf" in mime):
-            await self._reply(update, "Please send a *PDF* file.")
+            await self._reply(update, "Please send a PDF.", main_keyboard())
             return
-
-        await self._reply(update, f"⏳ Reading PDF `{doc.file_name}`…")
+        await self._reply(update, f"⏳ Reading `{doc.file_name}`…", main_keyboard())
         try:
             RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
             dest = RUNTIME_DIR / "last_upload.pdf"
             tg_file = await context.bot.get_file(doc.file_id)
             await tg_file.download_to_drive(custom_path=str(dest))
-
-            watched = list(self.settings.get("pairs", []))
-            book = load_pdf_book(dest, source_name=doc.file_name or "upload.pdf", watched=watched)
+            book = load_pdf_book(
+                dest,
+                source_name=doc.file_name or "upload.pdf",
+                watched=list(self.settings.get("pairs", [])),
+            )
             self.agent.set_pdf_book(book)
-
             if not book.ideas:
                 await self._reply(
                     update,
-                    f"PDF loaded (`{book.text_chars}` chars) but *no trade ideas* found.\n"
-                    "Tip: use text like `EURUSD BUY SL 1.08 TP 1.10`.\n"
-                    f"Preview: _{book.raw_preview[:200]}_",
+                    f"PDF read (`{book.text_chars}` chars) but no ideas found.\n"
+                    "Use text like `EURUSD BUY SL … TP …`",
+                    main_keyboard(),
                 )
                 return
-
             await self._reply(
                 update,
-                f"✅ PDF loaded — `{len(book.ideas)}` idea(s)\n\n"
-                f"{book.summary()}\n\n"
-                "Use `/pdftrade` to open the best idea, or wait for the 15m auto cycle.",
+                f"✅ Loaded *{len(book.ideas)}* idea(s)\n\n{book.summary()}\n\n"
+                "Say `pdf trade` or wait for auto cycle.",
+                main_keyboard(),
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("pdf upload failed")
-            await self._reply(update, f"❌ PDF failed: `{exc}`")
+            await self._reply(update, f"❌ PDF failed: `{exc}`", main_keyboard())
 
     def _quiet_hours(self) -> bool:
         qh = self.settings.get("quiet_hours") or {}
-        start = qh.get("start_hour_utc")
-        end = qh.get("end_hour_utc")
+        start, end = qh.get("start_hour_utc"), qh.get("end_hour_utc")
         if start is None or end is None:
             return False
         hour = datetime.now(timezone.utc).hour
@@ -673,58 +943,40 @@ class ForexTelegramBot:
         return hour >= start or hour < end
 
     async def job_auto_trade(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Every 15 minutes: scan tech+PDF and open MT5 trades."""
-        if not self.auto_enabled:
-            logger.info("Auto-trade skipped (disabled)")
+        if not self.auto_enabled or self._quiet_hours():
             return
-        if self._quiet_hours():
-            logger.info("Auto-trade skipped (quiet hours)")
-            return
-
         place_orders = bool(self.settings.get("auto_trade_enabled", True))
         max_new = int(self.settings.get("max_new_trades_per_cycle", 1))
-
         try:
             self.agent.reload_pdf_book()
             self.broker.ensure()
-
             signals = self.agent.rank_for_trade(self.agent.actionable())
             pdf_n = len(self.agent.pdf_book.ideas) if self.agent.pdf_book else 0
             lines = [
-                f"⏱ *15m auto cycle* @ `{datetime.now(timezone.utc).strftime('%H:%M UTC')}`",
-                f"Actionable: `{len(signals)}` | PDF ideas: `{pdf_n}`",
+                f"⏱ *15m cycle* `{datetime.now(timezone.utc).strftime('%H:%M UTC')}`",
+                f"Actionable: `{len(signals)}` · PDF: `{pdf_n}`",
             ]
-
             if not signals:
-                lines.append("No trades — no signal edge.")
+                lines.append("No trades this cycle.")
                 await self._notify(context, "\n".join(lines))
                 return
-
             opened = 0
             for sig in signals:
                 lines.append(sig.pretty())
-                if not place_orders:
-                    continue
-                if opened >= max_new:
-                    lines.append(f"_(max {max_new} new trade(s) per cycle)_")
+                if not place_orders or opened >= max_new:
+                    if opened >= max_new:
+                        lines.append(f"_(max {max_new}/cycle)_")
                     break
-                ok, msg, pos = self.broker.open_from_signal(sig)
+                ok, msg, _pos = self.broker.open_from_signal(sig)
                 lines.append(f"{'✅' if ok else '❌'} {msg}")
                 if ok:
                     opened += 1
-                logger.info("auto trade %s: %s", sig.pair, msg)
-
-            lines.append(f"\nOpened this cycle: `{opened}`")
-            lines.append("\n" + self.broker.summary())
+            lines.append(f"\nOpened: `{opened}`\n{self.broker.summary()}")
             await self._notify(context, "\n".join(lines))
         except Exception as exc:  # noqa: BLE001
-            logger.exception("auto trade cycle failed: %s", exc)
-            await self._notify(context, f"❌ Auto-trade cycle failed: `{exc}`")
+            logger.exception("auto trade failed")
+            await self._notify(context, f"❌ Auto cycle: `{exc}`")
 
     def run(self) -> None:
-        logger.info(
-            "Starting Telegram bot | MT5 | auto=%s | pdf=%s",
-            self.auto_enabled,
-            bool(self.agent.pdf_book and self.agent.pdf_book.ideas),
-        )
+        logger.info("Interactive bot starting | auto=%s", self.auto_enabled)
         self.app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
