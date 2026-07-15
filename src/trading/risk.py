@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 
 @dataclass
@@ -29,9 +29,14 @@ def position_size(
     pair: str,
     risk_pct: float = 1.0,
     min_lot: float = 0.01,
-    max_lot: float = 1.0,
+    max_lot: Optional[float] = None,
+    fixed_lot: Optional[float] = None,
 ) -> float:
-    """Approximate lot size from % risk (simplified FX model)."""
+    """Lot size: fixed_lot if set, else % risk model."""
+    if fixed_lot is not None and fixed_lot > 0:
+        lots = round(float(fixed_lot), 2)
+        return max(min_lot, lots)
+
     if equity <= 0 or entry <= 0 or stop_loss <= 0:
         return 0.0
     risk_amount = equity * (risk_pct / 100.0)
@@ -39,11 +44,11 @@ def position_size(
     if stop_distance <= 0:
         return 0.0
 
-    # Standard lot ≈ 100_000 units; P/L ≈ move * units
-    # For metals/JPY this is approximate — paper mode only.
     units = risk_amount / stop_distance
     lots = units / 100_000.0
-    lots = max(min_lot, min(max_lot, round(lots, 2)))
+    lots = max(min_lot, round(lots, 2))
+    if max_lot is not None and max_lot > 0:
+        lots = min(max_lot, lots)
     return lots
 
 
@@ -57,19 +62,30 @@ def check_trade(
     pair: str,
     risk_cfg: dict[str, Any],
 ) -> RiskDecision:
-    max_open = int(risk_cfg.get("max_open_positions", 3))
-    max_daily = float(risk_cfg.get("max_daily_loss_pct", 5.0))
+    # 0 or negative = unlimited open positions
+    max_open = int(risk_cfg.get("max_open_positions", 0))
+    max_daily = float(risk_cfg.get("max_daily_loss_pct", 0) or 0)
     risk_pct = float(risk_cfg.get("risk_per_trade_pct", 1.0))
     min_lot = float(risk_cfg.get("min_lot_size", 0.01))
-    max_lot = float(risk_cfg.get("max_lot_size", 1.0))
+    raw_max = risk_cfg.get("max_lot_size", None)
+    max_lot = float(raw_max) if raw_max not in (None, "", 0, "0") else None
+    fixed = risk_cfg.get("fixed_lot_size", None)
+    fixed_lot = float(fixed) if fixed not in (None, "", 0, "0") else None
 
-    if open_positions >= max_open:
+    if max_open > 0 and open_positions >= max_open:
         return RiskDecision(False, 0.0, f"Max open positions ({max_open}) reached")
-    if daily_pnl_pct <= -abs(max_daily):
+    if max_daily > 0 and daily_pnl_pct <= -abs(max_daily):
         return RiskDecision(False, 0.0, f"Daily loss limit ({max_daily}%) hit")
 
     lots = position_size(
-        equity, entry, stop_loss, pair, risk_pct=risk_pct, min_lot=min_lot, max_lot=max_lot
+        equity,
+        entry,
+        stop_loss,
+        pair,
+        risk_pct=risk_pct,
+        min_lot=min_lot,
+        max_lot=max_lot,
+        fixed_lot=fixed_lot,
     )
     if lots <= 0:
         return RiskDecision(False, 0.0, "Could not size position")

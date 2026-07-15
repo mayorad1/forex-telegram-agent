@@ -10,9 +10,17 @@ MAIN_ROWS = [
     [KeyboardButton("📂 Positions"), KeyboardButton("💰 Status")],
     [KeyboardButton("🟢 Buy"), KeyboardButton("🔴 Sell")],
     [KeyboardButton("📋 Pairs"), KeyboardButton("💲 Price")],
+    [KeyboardButton("📐 Lot"), KeyboardButton("📏 Lot size")],
     [KeyboardButton("🤖 Auto ON"), KeyboardButton("⏸ Auto OFF")],
     [KeyboardButton("🔌 MT5"), KeyboardButton("📄 PDF")],
     [KeyboardButton("🧹 Close all"), KeyboardButton("❓ Help")],
+]
+
+LOT_ROWS = [
+    [KeyboardButton("0.01"), KeyboardButton("0.02"), KeyboardButton("0.05")],
+    [KeyboardButton("0.10"), KeyboardButton("0.20"), KeyboardButton("0.50")],
+    [KeyboardButton("1.00"), KeyboardButton("2.00"), KeyboardButton("5.00")],
+    [KeyboardButton("⬅️ Menu"), KeyboardButton("💰 Status")],
 ]
 
 PAIR_ROWS = [
@@ -38,6 +46,10 @@ def pair_keyboard(title_hint: str = "") -> ReplyKeyboardMarkup:
 
 def yes_no_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(YES_NO_ROWS, resize_keyboard=True, one_time_keyboard=True)
+
+
+def lot_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(LOT_ROWS, resize_keyboard=True)
 
 
 def remove_keyboard() -> ReplyKeyboardRemove:

@@ -36,7 +36,11 @@ def main() -> None:
 
     settings = get_settings()
     agent = ForexAgent(settings)
-    broker = MT5Broker(risk_cfg=settings.get("risk", {}))
+    from src.trading.lot_settings import apply_lot_to_risk_cfg
+
+    risk_cfg = apply_lot_to_risk_cfg(dict(settings.get("risk", {})))
+    settings["risk"] = risk_cfg
+    broker = MT5Broker(risk_cfg=risk_cfg)
 
     logger.info("Connecting to MT5 / Exness (no paper mode)…")
     ok, msg = broker.connect(retries=2)

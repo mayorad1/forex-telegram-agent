@@ -20,9 +20,10 @@ from telegram.ext import (
 from src.agent.pdf_signals import clear_book, load_pdf_book, load_saved_book
 from src.agent.strategy import ForexAgent, Side, Signal
 from src.bot.chat_parser import CHAT_EXAMPLES, ChatIntent, extract_pair, parse_chat
-from src.bot.keyboards import main_keyboard, pair_keyboard, yes_no_keyboard
+from src.bot.keyboards import lot_keyboard, main_keyboard, pair_keyboard, yes_no_keyboard
 from src.bot.session import SessionStore
 from src.data.market_data import fetch_quote
+from src.trading.lot_settings import apply_lot_to_risk_cfg, load_fixed_lot, save_fixed_lot
 from src.trading.mt5_broker import MT5Broker
 from src.utils.config import RUNTIME_DIR, allowed_user_ids, env_str
 
@@ -63,6 +64,8 @@ BUTTON_MAP = {
     "⬅️ menu": "menu",
     "✅ yes": "yes",
     "❌ no": "no",
+    "📐 lot": "lot",
+    "📏 lot size": "lot",
 }
 
 
@@ -112,6 +115,7 @@ class ForexTelegramBot:
             ("pdfsignals", self.cmd_pdfsignals),
             ("pdfclear", self.cmd_pdfclear),
             ("pdfmode", self.cmd_pdfmode),
+            ("lot", self.cmd_lot),
         ]
         for name, fn in handlers:
             self.app.add_handler(CommandHandler(name, fn))
@@ -269,6 +273,11 @@ class ForexTelegramBot:
             await self._reply(update, "OK — back to menu. What next?", main_keyboard())
             return
 
+        # Multi-step: waiting for lot size
+        if sess.waiting == "lot":
+            await self._handle_lot_reply(update, sess, text)
+            return
+
         # Multi-step: waiting for pair
         if sess.waiting == "pair":
             await self._handle_pair_reply(update, context, sess, text)
@@ -277,6 +286,11 @@ class ForexTelegramBot:
         # Multi-step: waiting for yes/no confirm
         if sess.waiting == "confirm":
             await self._handle_confirm_reply(update, context, sess, text)
+            return
+
+        # Bare number while idle → treat as lot size shortcut
+        if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", text.strip()):
+            await self._set_lot(update, text.strip())
             return
 
         # Bare pair while idle → show signal interactively
@@ -485,12 +499,65 @@ class ForexTelegramBot:
             await self.cmd_pdfclear(update, context)
         elif name == "pdf_help":
             await self.cmd_pdf_help(update, context)
+        elif name == "set_lot" and intent.arg:
+            await self._set_lot(update, intent.arg)
+        elif name == "lot_menu":
+            sess.waiting = "lot"
+            sess.pending_action = "set_lot"
+            cur = load_fixed_lot() or self.settings.get("risk", {}).get("fixed_lot_size") or "auto"
+            await self._reply(
+                update,
+                f"Current lot: `{cur}`\n"
+                "Tap a size or type e.g. `0.05` / `lot 0.1`",
+                lot_keyboard(),
+            )
         else:
             await self._reply(
                 update,
-                "I'm here! Try `signals`, `buy eurusd`, or tap a button.",
+                "I'm here! Try `signals`, `buy eurusd`, `lot 0.05`, or tap a button.",
                 main_keyboard(),
             )
+
+    async def _handle_lot_reply(self, update: Update, sess, text: str) -> None:
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", text.replace(",", "."))
+        if not m:
+            await self._reply(
+                update,
+                "Send a number like `0.01` or `0.10`",
+                lot_keyboard(),
+            )
+            return
+        sess.clear_pending()
+        await self._set_lot(update, m.group(1))
+
+    async def _set_lot(self, update: Update, raw: str) -> None:
+        try:
+            lots = float(raw.replace(",", "."))
+        except ValueError:
+            await self._reply(update, "Invalid lot. Example: `lot 0.05`", main_keyboard())
+            return
+        if lots <= 0:
+            await self._reply(update, "Lot must be greater than 0.", main_keyboard())
+            return
+        if lots > 100:
+            await self._reply(
+                update,
+                "Lot looks huge (`>100`). Type again if you meant it, e.g. `0.10`.",
+                main_keyboard(),
+            )
+            return
+        lots = round(lots, 2)
+        save_fixed_lot(lots)
+        # live update broker risk
+        self.broker.risk_cfg["fixed_lot_size"] = lots
+        self.settings.setdefault("risk", {})["fixed_lot_size"] = lots
+        await self._reply(
+            update,
+            f"✅ Lot size set to `{lots}` for *all new trades*\n"
+            f"(unlimited open positions · unlimited per cycle)\n\n"
+            f"Change anytime: `lot 0.02` or tap *Lot*",
+            main_keyboard(),
+        )
 
     # ── trading actions ──────────────────────────────────────
 
@@ -631,10 +698,16 @@ class ForexTelegramBot:
                 f"PDF: `{self.agent.pdf_book.source_name}` "
                 f"({len(self.agent.pdf_book.ideas)} ideas, `{pdf_cfg.get('mode', 'blend')}`)"
             )
+        lot = load_fixed_lot() or self.settings.get("risk", {}).get("fixed_lot_size") or "auto %"
+        max_open = self.settings.get("risk", {}).get("max_open_positions", 0)
+        max_cycle = self.settings.get("max_new_trades_per_cycle", 0)
         text = (
             f"*Status* @ `{now}`\n"
             f"Mode: `MT5 Exness`\n"
             f"Auto-trade: `{'ON' if self.auto_enabled else 'OFF'}` every `{mins}m`\n"
+            f"Lot size: `{lot}` · open limit: "
+            f"`{'∞' if not max_open else max_open}` · per cycle: "
+            f"`{'∞' if not max_cycle else max_cycle}`\n"
             f"MT5: `{'✅ connected' if self.broker.connected else '❌ disconnected'}`\n"
             f"{pdf_line}\n"
             f"Pairs: `{', '.join(self.settings.get('pairs', []))}`\n\n"
@@ -870,6 +943,22 @@ class ForexTelegramBot:
         self.agent.set_pdf_book(None)
         await self._reply(update, "PDF ideas cleared.", main_keyboard())
 
+    async def cmd_lot(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._auth(update):
+            return
+        if context.args:
+            await self._set_lot(update, context.args[0])
+            return
+        sess = self.sessions.get(self._uid(update))
+        sess.waiting = "lot"
+        sess.pending_action = "set_lot"
+        cur = load_fixed_lot() or self.settings.get("risk", {}).get("fixed_lot_size") or "auto"
+        await self._reply(
+            update,
+            f"Current lot: `{cur}`\nTap a size or type `lot 0.05`",
+            lot_keyboard(),
+        )
+
     async def cmd_pdfmode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
@@ -946,15 +1035,21 @@ class ForexTelegramBot:
         if not self.auto_enabled or self._quiet_hours():
             return
         place_orders = bool(self.settings.get("auto_trade_enabled", True))
-        max_new = int(self.settings.get("max_new_trades_per_cycle", 1))
+        max_new = int(self.settings.get("max_new_trades_per_cycle", 0) or 0)
+        # 0 = unlimited trades this cycle
+        unlimited = max_new <= 0
         try:
+            # refresh lot from disk (Telegram may have changed it)
+            apply_lot_to_risk_cfg(self.broker.risk_cfg)
             self.agent.reload_pdf_book()
             self.broker.ensure()
             signals = self.agent.rank_for_trade(self.agent.actionable())
             pdf_n = len(self.agent.pdf_book.ideas) if self.agent.pdf_book else 0
+            lot = self.broker.risk_cfg.get("fixed_lot_size") or load_fixed_lot() or "?"
             lines = [
                 f"⏱ *15m cycle* `{datetime.now(timezone.utc).strftime('%H:%M UTC')}`",
-                f"Actionable: `{len(signals)}` · PDF: `{pdf_n}`",
+                f"Actionable: `{len(signals)}` · PDF: `{pdf_n}` · lot: `{lot}` · "
+                f"limit: `{'∞' if unlimited else max_new}`",
             ]
             if not signals:
                 lines.append("No trades this cycle.")
@@ -963,9 +1058,10 @@ class ForexTelegramBot:
             opened = 0
             for sig in signals:
                 lines.append(sig.pretty())
-                if not place_orders or opened >= max_new:
-                    if opened >= max_new:
-                        lines.append(f"_(max {max_new}/cycle)_")
+                if not place_orders:
+                    continue
+                if not unlimited and opened >= max_new:
+                    lines.append(f"_(max {max_new}/cycle)_")
                     break
                 ok, msg, _pos = self.broker.open_from_signal(sig)
                 lines.append(f"{'✅' if ok else '❌'} {msg}")

@@ -354,6 +354,21 @@ INTENT_PHRASES: list[tuple[str, list[str], bool]] = [
         ],
         False,
     ),
+    (
+        "lot",
+        [
+            "lot",
+            "lots",
+            "lot size",
+            "set lot",
+            "change lot",
+            "volume",
+            "size",
+            "position size",
+            "how many lots",
+        ],
+        False,
+    ),
 ]
 
 
@@ -447,6 +462,16 @@ def parse_chat(text: str) -> Optional[ChatIntent]:
     low = _norm(raw)
     pair = extract_pair(raw)
 
+    # Explicit lot size first: "lot 0.05", "0.1 lots", "set lot to 0.2"
+    lot_m = re.search(
+        r"\b(?:set\s+)?(?:lot|lots|volume)\b\s*(?:size\s*)?(?:to|=|:)?\s*([0-9]+(?:\.[0-9]+)?)",
+        low,
+    )
+    if not lot_m:
+        lot_m = re.search(r"\b([0-9]+(?:\.[0-9]+)?)\s*(?:lot|lots)\b", low)
+    if lot_m:
+        return ChatIntent("set_lot", arg=lot_m.group(1), raw=raw, matched="lot", confidence=1.0)
+
     # Score all intent phrases
     best: Optional[tuple[float, str, str, bool]] = None  # score, intent, matched, needs_pair
 
@@ -502,6 +527,9 @@ def parse_chat(text: str) -> Optional[ChatIntent]:
         return ChatIntent("auto", arg="on", raw=raw, matched=matched)
     if intent_name == "auto_off":
         return ChatIntent("auto", arg="off", raw=raw, matched=matched)
+
+    if intent_name == "lot":
+        return ChatIntent("lot_menu", raw=raw, matched=matched)
 
     if intent_name in {"signal", "price", "trade", "close_pair"}:
         if not pair:
@@ -586,6 +614,9 @@ CHAT_EXAMPLES = """
 
 *PDF*
 `pdf signals` · `pdf trade` · send a PDF file
+
+*Lot size*
+`lot` · `lot 0.05` · `set lot 0.1` · `0.02 lots`
 
 Typos are OK — I'll try to detect what you meant.
 """.strip()

@@ -316,7 +316,12 @@ class MT5Broker:
         volume = float(decision.lots)
         step = sym.volume_step or 0.01
         vmin = sym.volume_min or 0.01
-        vmax = min(sym.volume_max or 100.0, float(self.risk_cfg.get("max_lot_size", 1.0)))
+        broker_max = float(sym.volume_max or 100.0)
+        cfg_max = self.risk_cfg.get("max_lot_size", None)
+        if cfg_max not in (None, "", 0, "0"):
+            vmax = min(broker_max, float(cfg_max))
+        else:
+            vmax = broker_max  # no app-side cap
         volume = max(vmin, min(vmax, round(round(volume / step) * step, 2)))
 
         order_type = mt5.ORDER_TYPE_BUY if signal.side == Side.BUY else mt5.ORDER_TYPE_SELL

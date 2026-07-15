@@ -28,29 +28,35 @@ strategy:
   tp_atr_mult: 2.5
 
 risk:
-  max_open_positions: 3
+  # 0 = unlimited open positions
+  max_open_positions: 0
   risk_per_trade_pct: 1.0
-  max_daily_loss_pct: 5.0
-  max_lot_size: 0.10
+  # 0 = no daily loss lockout
+  max_daily_loss_pct: 0
+  # null / omit = no max lot cap (broker max only)
+  max_lot_size: null
   min_lot_size: 0.01
+  # Fixed lot for every trade (override % risk). Change in Telegram: "lot 0.05"
+  # null = use % risk sizing instead
+  fixed_lot_size: 0.01
 
-# Auto trade every N minutes (opens MT5 trades on actionable signals)
+# Auto trade every N minutes
 scan_interval_minutes: 15
-auto_trade_on_start: true   # start auto trading without /auto on
-auto_trade_enabled: true    # place real MT5 orders (not alerts only)
-max_new_trades_per_cycle: 1 # open at most this many new positions each cycle
+auto_trade_on_start: true
+auto_trade_enabled: true
+# 0 = unlimited new trades per 15m cycle (all actionable signals)
+max_new_trades_per_cycle: 0
 
-# PDF research / signal sheets (upload via Telegram)
+# PDF research / signal sheets
 pdf:
   enabled: true
-  # blend = tech + PDF boost | pdf_priority = PDF direction wins | pdf_only = only PDF pairs
   mode: blend
-  score_boost: 1              # points added when PDF agrees with tech
-  use_pdf_levels: true        # use SL/TP from PDF when present
-  allow_pdf_when_flat: true   # if tech is flat, still take PDF direction
-  block_on_conflict: false    # if true, skip when PDF and tech disagree
-  include_pdf_pairs: true     # scan pairs mentioned in PDF even if not in pairs list
-  relax_min_score: false      # if true, min_score - 1 when a PDF is loaded
+  score_boost: 1
+  use_pdf_levels: true
+  allow_pdf_when_flat: true
+  block_on_conflict: false
+  include_pdf_pairs: true
+  relax_min_score: false
 
 quiet_hours:
   start_hour_utc: null
