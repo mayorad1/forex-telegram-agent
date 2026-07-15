@@ -1,10 +1,9 @@
-"""Telegram interface — MT5 Exness trading agent + PDF signal sheets."""
+"""Telegram interface — MT5 Exness trading agent + PDF + natural chat."""
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Optional
 
 from telegram import Update
@@ -18,7 +17,8 @@ from telegram.ext import (
 )
 
 from src.agent.pdf_signals import clear_book, load_pdf_book, load_saved_book
-from src.agent.strategy import ForexAgent
+from src.agent.strategy import ForexAgent, Side, Signal
+from src.bot.chat_parser import ChatIntent, parse_chat
 from src.data.market_data import fetch_quote
 from src.trading.mt5_broker import MT5Broker
 from src.utils.config import RUNTIME_DIR, allowed_user_ids, env_str
@@ -26,29 +26,25 @@ from src.utils.config import RUNTIME_DIR, allowed_user_ids, env_str
 logger = logging.getLogger(__name__)
 
 HELP_TEXT = """
-*Forex MT5 Agent (Exness)*
+*Forex Agent* — type normally (no `/` needed)
 
-/start — welcome
-/help — help
-/status — MT5 + PDF status
-/mt5 — reconnect MT5
-/price `<PAIR>` — quote
-/scan — scan pairs (tech + PDF)
-/signal `<PAIR>` — full signal
-/trade `<PAIR>` — open MT5 trade
-/pdftrade — trade best idea from loaded PDF
-/positions — open MT5 positions
-/closeall — close all MT5 positions
-/auto on|off — auto-trade every 15m
-/pairs — watched pairs
+*Easy chat examples*
+• `signals` / `give me signals` / `scan`
+• `signal gold` / `check eurusd`
+• `price gbpusd`
+• `buy eurusd` / `sell gold` / `buy for usdjpy`
+• `trade eurusd` (uses strategy signal)
+• `positions` / `status` / `pairs`
+• `close all`
+• `auto on` / `auto off`
+• `pdf signals` / `pdf trade`
 
-*PDF research*
-Send a *PDF file* (or /pdf + attach PDF)
-/pdfsignals — show ideas extracted from PDF
-/pdfclear — remove PDF ideas
-/pdfmode blend|pdf\\_priority|pdf\\_only — how PDF affects picks
+*Or slash commands* (still work)
+/scan /signal /trade /price /positions /status /mt5 /auto
 
-_Text PDFs work best (EURUSD BUY, SL, TP). Not financial advice._
+*PDF* — just send a PDF file in chat
+
+_Not financial advice._
 """.strip()
 
 
@@ -106,6 +102,10 @@ class ForexTelegramBot:
                 filters.Document.PDF | filters.Document.MimeType("application/pdf"),
                 self.on_pdf_document,
             )
+        )
+        # Natural language (no slash) — after commands so /foo still works
+        self.app.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_chat_text)
         )
 
         minutes = int(self.settings.get("scan_interval_minutes", 15))
@@ -166,11 +166,186 @@ class ForexTelegramBot:
         pdf_n = len(self.agent.pdf_book.ideas) if self.agent.pdf_book else 0
         await self._reply(
             update,
-            f"👋 MT5 Exness agent online.\n"
+            f"👋 Ready. Just type messages like *signals* or *buy eurusd*.\n"
             f"Auto-trade 15m: `{'ON' if self.auto_enabled else 'OFF'}`\n"
-            f"PDF ideas loaded: `{pdf_n}`\n"
-            f"Your ID: `{uid}`\n\n{HELP_TEXT}",
+            f"PDF ideas: `{pdf_n}` | ID: `{uid}`\n\n{HELP_TEXT}",
         )
+
+    async def on_chat_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle plain English / casual commands without /."""
+        if not await self._auth(update):
+            return
+        text = (update.message.text if update.message else "") or ""
+        intent = parse_chat(text)
+        if intent is None:
+            await self._reply(
+                update,
+                "I didn't catch that. Try:\n"
+                "• `signals`\n"
+                "• `buy eurusd` / `sell gold`\n"
+                "• `price gbpusd`\n"
+                "• `positions` / `status`\n"
+                "• `help`",
+            )
+            return
+        await self._dispatch_intent(update, context, intent)
+
+    async def _dispatch_intent(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        intent: ChatIntent,
+    ) -> None:
+        name = intent.name
+        if name == "help":
+            await self.cmd_help(update, context)
+        elif name == "scan":
+            await self.cmd_scan(update, context)
+        elif name == "signal" and intent.pair:
+            context.args = [intent.pair]
+            await self.cmd_signal(update, context)
+        elif name == "price" and intent.pair:
+            context.args = [intent.pair]
+            await self.cmd_price(update, context)
+        elif name == "trade" and intent.pair:
+            context.args = [intent.pair]
+            await self.cmd_trade(update, context)
+        elif name == "force_trade" and intent.pair and intent.side:
+            await self._force_trade(update, intent.pair, intent.side)
+        elif name == "need_pair":
+            await self._reply(
+                update,
+                f"Which pair do you want to *{intent.side}*? e.g. `{intent.side} eurusd`",
+            )
+        elif name == "positions":
+            await self.cmd_positions(update, context)
+        elif name == "status":
+            await self.cmd_status(update, context)
+        elif name == "pairs":
+            await self.cmd_pairs(update, context)
+        elif name == "closeall":
+            await self.cmd_closeall(update, context)
+        elif name == "close_pair" and intent.pair:
+            await self._close_pair(update, intent.pair)
+        elif name == "auto" and intent.arg:
+            context.args = [intent.arg]
+            await self.cmd_auto(update, context)
+        elif name == "mt5":
+            await self.cmd_mt5(update, context)
+        elif name == "pdfsignals":
+            await self.cmd_pdfsignals(update, context)
+        elif name == "pdftrade":
+            await self.cmd_pdftrade(update, context)
+        elif name == "pdfclear":
+            await self.cmd_pdfclear(update, context)
+        elif name == "pdf_help":
+            await self.cmd_pdf_help(update, context)
+        else:
+            await self._reply(update, "Try `help` for examples.")
+
+    async def _force_trade(self, update: Update, pair: str, side: str) -> None:
+        """Open MT5 trade on request (buy/sell for pair), with tech SL/TP if possible."""
+        await self._reply(update, f"⏳ Opening *{side}* on `{pair}`…")
+        try:
+            # Build signal from market analysis but force user side
+            try:
+                sig = self.agent.analyze_pair(pair)
+            except Exception:  # noqa: BLE001
+                q = fetch_quote(pair)
+                sig = Signal(
+                    pair=pair,
+                    side=Side.BUY if side == "BUY" else Side.SELL,
+                    price=q.price,
+                    score=2,
+                    confidence=0.5,
+                    reasons=[f"Manual {side} request"],
+                    timeframe="manual",
+                )
+            # force direction
+            forced = Side.BUY if side == "BUY" else Side.SELL
+            if sig.side != forced or sig.stop_loss is None:
+                # rebuild SL/TP for forced side using ATR if available
+                price = sig.price or fetch_quote(pair).price
+                atr = sig.atr or (price * 0.001)
+                sl_m = float(self.settings.get("strategy", {}).get("sl_atr_mult", 1.5))
+                tp_m = float(self.settings.get("strategy", {}).get("tp_atr_mult", 2.5))
+                if forced == Side.BUY:
+                    sl, tp = price - atr * sl_m, price + atr * tp_m
+                else:
+                    sl, tp = price + atr * sl_m, price - atr * tp_m
+                sig = Signal(
+                    pair=pair,
+                    side=forced,
+                    price=price,
+                    score=max(sig.score, 2),
+                    confidence=max(sig.confidence, 0.5),
+                    reasons=list(sig.reasons) + [f"Manual chat: {side} {pair}"],
+                    stop_loss=sl,
+                    take_profit=tp,
+                    atr=atr,
+                    rsi=sig.rsi,
+                    timeframe=sig.timeframe,
+                )
+            else:
+                sig.side = forced
+                sig.reasons.append(f"Manual chat: {side} {pair}")
+
+            ok, msg, pos = self.broker.open_from_signal(sig)
+            extra = f"\n{pos.side} {pos.lots} {pos.pair} @ {pos.entry}" if pos else ""
+            await self._reply(
+                update,
+                f"{'✅' if ok else '❌'} {msg}{extra}\n\n{sig.pretty()}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            await self._reply(update, f"Trade failed: `{exc}`")
+
+    async def _close_pair(self, update: Update, pair: str) -> None:
+        try:
+            self.broker.ensure()
+            import MetaTrader5 as mt5
+
+            positions = mt5.positions_get()
+            if not positions:
+                await self._reply(update, "No open positions.")
+                return
+            target = pair.upper().replace("/", "")
+            closed = []
+            for p in positions:
+                sym = p.symbol.upper().replace(".", "").replace("M", "")
+                if target in p.symbol.upper().replace("/", "") or target in sym:
+                    # close via broker close_all filtered — reuse order_send path
+                    tick = mt5.symbol_info_tick(p.symbol)
+                    if tick is None:
+                        closed.append(f"No tick for {p.symbol}")
+                        continue
+                    if p.type == mt5.POSITION_TYPE_BUY:
+                        otype, price = mt5.ORDER_TYPE_SELL, tick.bid
+                    else:
+                        otype, price = mt5.ORDER_TYPE_BUY, tick.ask
+                    req = {
+                        "action": mt5.TRADE_ACTION_DEAL,
+                        "symbol": p.symbol,
+                        "volume": p.volume,
+                        "type": otype,
+                        "position": p.ticket,
+                        "price": price,
+                        "deviation": 30,
+                        "magic": self.broker.MAGIC,
+                        "comment": "chat close",
+                        "type_time": mt5.ORDER_TIME_GTC,
+                        "type_filling": self.broker._filling_mode(p.symbol),
+                    }
+                    r = mt5.order_send(req)
+                    if r and r.retcode == mt5.TRADE_RETCODE_DONE:
+                        closed.append(f"Closed {p.symbol} #{p.ticket}")
+                    else:
+                        closed.append(f"Fail {p.symbol}: {getattr(r, 'comment', r)}")
+            if not closed:
+                await self._reply(update, f"No open position matching `{pair}`.")
+            else:
+                await self._reply(update, "\n".join(closed))
+        except Exception as exc:  # noqa: BLE001
+            await self._reply(update, f"Close failed: `{exc}`")
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
