@@ -18,7 +18,7 @@ from telegram.ext import (
 
 from src.agent.pdf_signals import clear_book, load_pdf_book, load_saved_book
 from src.agent.strategy import ForexAgent, Side, Signal
-from src.bot.chat_parser import ChatIntent, parse_chat
+from src.bot.chat_parser import CHAT_EXAMPLES, ChatIntent, parse_chat
 from src.data.market_data import fetch_quote
 from src.trading.mt5_broker import MT5Broker
 from src.utils.config import RUNTIME_DIR, allowed_user_ids, env_str
@@ -26,23 +26,11 @@ from src.utils.config import RUNTIME_DIR, allowed_user_ids, env_str
 logger = logging.getLogger(__name__)
 
 HELP_TEXT = """
-*Forex Agent* — type normally (no `/` needed)
+*Forex Agent* — no slash needed. I detect your words.
 
-*Easy chat examples*
-• `signals` / `give me signals` / `scan`
-• `signal gold` / `check eurusd`
-• `price gbpusd`
-• `buy eurusd` / `sell gold` / `buy for usdjpy`
-• `trade eurusd` (uses strategy signal)
-• `positions` / `status` / `pairs`
-• `close all`
-• `auto on` / `auto off`
-• `pdf signals` / `pdf trade`
+""" + CHAT_EXAMPLES + """
 
-*Or slash commands* (still work)
-/scan /signal /trade /price /positions /status /mt5 /auto
-
-*PDF* — just send a PDF file in chat
+*Slash still works:* /scan /trade /status /mt5 /auto
 
 _Not financial advice._
 """.strip()
@@ -178,16 +166,11 @@ class ForexTelegramBot:
         text = (update.message.text if update.message else "") or ""
         intent = parse_chat(text)
         if intent is None:
-            await self._reply(
-                update,
-                "I didn't catch that. Try:\n"
-                "• `signals`\n"
-                "• `buy eurusd` / `sell gold`\n"
-                "• `price gbpusd`\n"
-                "• `positions` / `status`\n"
-                "• `help`",
-            )
+            await self._reply(update, "Try `help` or `signals`.")
             return
+        # Light feedback when we fuzzy-matched
+        if intent.matched and intent.name not in {"unknown", "help"}:
+            logger.info("chat intent=%s pair=%s side=%s matched=%r", intent.name, intent.pair, intent.side, intent.matched)
         await self._dispatch_intent(update, context, intent)
 
     async def _dispatch_intent(
@@ -199,6 +182,14 @@ class ForexTelegramBot:
         name = intent.name
         if name == "help":
             await self.cmd_help(update, context)
+        elif name == "unknown":
+            pair_hint = f"\nI saw pair `{intent.pair}`." if intent.pair else ""
+            await self._reply(
+                update,
+                f"Not sure what you mean by _{intent.raw[:80]}_.\n"
+                f"Did you mean: {intent.arg}?{pair_hint}\n\n"
+                "Examples: `signals` · `buy eurusd` · `positions` · `help`",
+            )
         elif name == "scan":
             await self.cmd_scan(update, context)
         elif name == "signal" and intent.pair:
@@ -212,10 +203,14 @@ class ForexTelegramBot:
             await self.cmd_trade(update, context)
         elif name == "force_trade" and intent.pair and intent.side:
             await self._force_trade(update, intent.pair, intent.side)
+        elif name == "best_trade":
+            await self._best_trade(update)
         elif name == "need_pair":
+            action = intent.side or intent.arg or "use"
             await self._reply(
                 update,
-                f"Which pair do you want to *{intent.side}*? e.g. `{intent.side} eurusd`",
+                f"Which pair? e.g. `{action} eurusd` or `{action} gold`\n"
+                "Pairs: eurusd, gbpusd, usdjpy, gold, audusd, usdcad…",
             )
         elif name == "positions":
             await self.cmd_positions(update, context)
@@ -242,6 +237,30 @@ class ForexTelegramBot:
             await self.cmd_pdf_help(update, context)
         else:
             await self._reply(update, "Try `help` for examples.")
+
+    async def _best_trade(self, update: Update) -> None:
+        """Scan and open the single best actionable signal."""
+        await self._reply(update, "⏳ Finding best setup…")
+        try:
+            signals = self.agent.rank_for_trade(self.agent.actionable())
+            if not signals:
+                # show scan summary even if none actionable
+                all_sigs = self.agent.scan()
+                lines = ["No strong setup right now.\n*Latest scores:*"]
+                for s in sorted(all_sigs, key=lambda x: x.score, reverse=True)[:6]:
+                    lines.append(f"• `{s.pair}` {s.side.value} score={s.score}")
+                lines.append("\nTry `signals` for full detail.")
+                await self._reply(update, "\n".join(lines))
+                return
+            pick = signals[0]
+            ok, msg, pos = self.broker.open_from_signal(pick)
+            extra = f"\n{pos.side} {pos.lots} @ {pos.entry}" if pos else ""
+            await self._reply(
+                update,
+                f"{'✅' if ok else '❌'} *Best pick* `{pick.pair}`\n{msg}{extra}\n\n{pick.pretty()}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            await self._reply(update, f"Best trade failed: `{exc}`")
 
     async def _force_trade(self, update: Update, pair: str, side: str) -> None:
         """Open MT5 trade on request (buy/sell for pair), with tech SL/TP if possible."""
