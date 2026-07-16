@@ -74,6 +74,7 @@ BUTTON_MAP = {
     "📐 lot": "lot",
     "📏 lot size": "lot",
     "⏱ interval": "interval",
+    "📰 news": "news",
 }
 
 
@@ -125,6 +126,7 @@ class ForexTelegramBot:
             ("pdfmode", self.cmd_pdfmode),
             ("lot", self.cmd_lot),
             ("interval", self.cmd_interval),
+            ("news", self.cmd_news),
         ]
         for name, fn in handlers:
             self.app.add_handler(CommandHandler(name, fn))
@@ -250,14 +252,15 @@ class ForexTelegramBot:
         mins = self._interval_minutes()
         await self._reply(
             update,
-            f"👋 *Hi!* PDF-only auto trader ready.\n\n"
-            f"• Send a *PDF* with trade ideas\n"
-            f"• Auto trades *only from that PDF*\n"
-            f"• Interval: *every {mins} min* (change: `interval 5`)\n"
-            f"• Trades: *unlimited* · lot: change with `lot 0.01`\n\n"
+            f"👋 *Trading agent ready*\n\n"
+            f"Before *every* trade I check:\n"
+            f"1. 📄 *PDF idea* (must exist)\n"
+            f"2. 📈 *Market tech* (must agree with PDF)\n"
+            f"3. 📰 *News* (no high-impact blackout)\n\n"
+            f"• Send a PDF · `news` · `interval 15` · `lot 0.01`\n"
+            f"• Unlimited positions · every *{mins} min*\n\n"
             f"Auto: `{'ON' if self.auto_enabled else 'OFF'}` · PDF ideas: `{pdf_n}`\n"
-            f"MT5: `{'connected' if self.broker.connected else 'reconnect'}`\n\n"
-            f"Tap a button or type a command 👇",
+            f"MT5: `{'connected' if self.broker.connected else 'reconnect'}`",
             main_keyboard(),
         )
 
@@ -537,6 +540,8 @@ class ForexTelegramBot:
             await self.cmd_pdfclear(update, context)
         elif name == "pdf_help":
             await self.cmd_pdf_help(update, context)
+        elif name == "news":
+            await self.cmd_news(update, context)
         elif name == "set_lot" and intent.arg:
             await self._set_lot(update, intent.arg)
         elif name == "lot_menu":
@@ -1055,6 +1060,45 @@ class ForexTelegramBot:
             interval_keyboard(),
         )
 
+    async def cmd_news(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._auth(update):
+            return
+        from src.data.news_filter import check_news_for_pair, fetch_week_events, market_session_ok
+
+        pair = None
+        if context.args:
+            pair = context.args[0].upper().replace("/", "")
+        # try pair from free text stored
+        await self._reply(update, "⏳ Checking calendar + session…", main_keyboard())
+        try:
+            ok_s, sess_msg = market_session_ok(avoid_rollover=True)
+            lines = [
+                "*📰 News & session check*",
+                f"Session: `{'OK' if ok_s else 'BLOCK'}` — {sess_msg}",
+            ]
+            pairs = [pair] if pair else list(self.settings.get("pairs", []))[:6]
+            news_cfg = (self.settings.get("risk") or {}).get("news") or {}
+            for p in pairs:
+                chk = check_news_for_pair(
+                    p,
+                    block_minutes_before=int(news_cfg.get("block_minutes_before", 30)),
+                    block_minutes_after=int(news_cfg.get("block_minutes_after", 15)),
+                    min_impact=str(news_cfg.get("min_impact", "High")),
+                )
+                mark = "✅" if chk.allowed else "🚫"
+                lines.append(f"{mark} `{p}`: {chk.reason}")
+                for ev in chk.blocking[:2]:
+                    lines.append(f"   • {ev.pretty()}")
+                for ev in chk.upcoming[:2]:
+                    if ev not in chk.blocking:
+                        lines.append(f"   ⏳ {ev.pretty()}")
+            lines.append(
+                "\n_Trades need: PDF idea + market agree + news OK_"
+            )
+            await self._reply(update, "\n".join(lines), main_keyboard())
+        except Exception as exc:  # noqa: BLE001
+            await self._reply(update, f"❌ News check failed: `{exc}`", main_keyboard())
+
     async def cmd_pdfmode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
@@ -1142,23 +1186,30 @@ class ForexTelegramBot:
             lot = self.broker.risk_cfg.get("fixed_lot_size") or load_fixed_lot() or "?"
             pdf_mode = (self.settings.get("pdf") or {}).get("mode", "blend")
 
-            if pdf_mode == "pdf_only" and pdf_n == 0:
+            if pdf_mode in {"pdf_only", "pdf_market", "pdf_priority"} and pdf_n == 0:
                 await self._notify(
                     context,
-                    f"⏱ *{mins}m cycle* — PDF-only mode\n"
-                    "❌ No PDF loaded. Send a PDF with ideas like `EURUSD BUY SL … TP …`",
+                    f"⏱ *{mins}m cycle* — needs PDF\n"
+                    "❌ No PDF loaded. Send ideas like `EURUSD BUY SL … TP …`",
                 )
                 return
+
+            # sync news config onto broker risk for pre-trade guards
+            news_cfg = (self.settings.get("risk") or {}).get("news") or {}
+            self.broker.risk_cfg["news"] = news_cfg
+            self.broker.risk_cfg["news_enabled"] = news_cfg.get("enabled", True)
 
             self.broker.ensure()
             signals = self.agent.rank_for_trade(self.agent.actionable())
             lines = [
                 f"⏱ *{mins}m cycle* `{datetime.now(timezone.utc).strftime('%H:%M UTC')}`",
-                f"Mode: `{pdf_mode}` · PDF ideas: `{pdf_n}` · actionable: `{len(signals)}`",
-                f"Lot: `{lot}` · limit: `{'∞' if unlimited else max_new}`",
+                f"Filters: PDF+market+news · mode=`{pdf_mode}` · PDF=`{pdf_n}`",
+                f"Actionable: `{len(signals)}` · lot=`{lot}` · limit=`{'∞' if unlimited else max_new}`",
             ]
             if not signals:
-                lines.append("No PDF trades this cycle.")
+                lines.append(
+                    "No trades — need PDF idea *and* market agreement *and* clear news window."
+                )
                 await self._notify(context, "\n".join(lines))
                 return
             opened = 0

@@ -267,13 +267,39 @@ class ForexAgent:
             if idea.take_profit is not None:
                 signal.take_profit = idea.take_profit
 
-        if mode in {"pdf_priority", "pdf_only"}:
-            # PDF direction is the trade; market price + ATR if PDF has no levels
-            signal.side = pdf_side
+        if mode in {"pdf_priority", "pdf_only", "pdf_market"}:
+            # PDF sets direction; pdf_market also requires tech not against PDF
+            tech_side = signal.side
             min_sc = int(self.strat.get("min_score", 2))
-            signal.score = max(signal.score, min_sc, int(self.pdf_cfg.get("pdf_score", min_sc)))
-            signal.confidence = max(signal.confidence, idea.confidence, 0.7)
-            signal.reasons.append(f"PDF-only/priority: following PDF {idea.side}")
+            pdf_sc = int(self.pdf_cfg.get("pdf_score", min_sc))
+
+            if mode == "pdf_market":
+                # Require market (tech) to agree with PDF
+                if tech_side == Side.FLAT:
+                    signal.side = Side.FLAT
+                    signal.score = 0
+                    signal.confidence = 0.0
+                    signal.reasons.append("PDF+market: tech is FLAT — wait for market confirm")
+                    return signal
+                if tech_side != pdf_side:
+                    signal.side = Side.FLAT
+                    signal.score = 0
+                    signal.confidence = 0.0
+                    signal.reasons.append(
+                        f"PDF+market: PDF {pdf_side.value} vs tech {tech_side.value} — blocked"
+                    )
+                    return signal
+                signal.side = pdf_side
+                signal.score = max(signal.score, pdf_sc)
+                signal.confidence = min(1.0, max(signal.confidence, idea.confidence) + 0.1)
+                signal.reasons.append("PDF+market: PDF and tech AGREE ✓")
+            else:
+                # pure PDF direction
+                signal.side = pdf_side
+                signal.score = max(signal.score, min_sc, pdf_sc)
+                signal.confidence = max(signal.confidence, idea.confidence, 0.7)
+                signal.reasons.append(f"PDF mode: following PDF {idea.side}")
+
             if signal.stop_loss is None and signal.atr and signal.price:
                 mult_sl = float(self.strat.get("sl_atr_mult", 1.5))
                 mult_tp = float(self.strat.get("tp_atr_mult", 2.5))

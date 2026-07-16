@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from src.agent.strategy import Side, Signal
+from src.data.news_filter import check_news_for_pair, market_session_ok
 from src.trading.risk import check_trade
 from src.utils.config import env_int, env_str
 
@@ -274,6 +275,39 @@ class MT5Broker:
             )
         return out
 
+    def _pre_trade_guards(self, pair: str) -> tuple[bool, str]:
+        """Session + news checks (always before order)."""
+        news_cfg = self.risk_cfg.get("news") or {}
+        # also allow top-level keys on risk_cfg for simplicity
+        enabled = bool(news_cfg.get("enabled", self.risk_cfg.get("news_enabled", True)))
+        if not enabled:
+            return True, "News filter off"
+
+        avoid_rollover = bool(news_cfg.get("avoid_rollover", True))
+        prefer_ln = bool(news_cfg.get("prefer_london_ny", False))
+        ok_sess, sess_msg = market_session_ok(
+            avoid_rollover=avoid_rollover,
+            prefer_london_ny=prefer_ln,
+        )
+        if not ok_sess:
+            return False, f"Session block: {sess_msg}"
+
+        before = int(news_cfg.get("block_minutes_before", 30))
+        after = int(news_cfg.get("block_minutes_after", 15))
+        impact = str(news_cfg.get("min_impact", "High"))
+        fail_closed = bool(news_cfg.get("fail_closed", False))
+        check = check_news_for_pair(
+            pair,
+            block_minutes_before=before,
+            block_minutes_after=after,
+            min_impact=impact,
+            fail_closed=fail_closed,
+        )
+        if not check.allowed:
+            detail = "; ".join(e.pretty() for e in check.blocking[:3])
+            return False, f"{check.reason}. {detail}"
+        return True, check.reason
+
     def open_from_signal(self, signal: Signal) -> tuple[bool, str, Optional[MT5Position]]:
         self.ensure()
         if signal.side == Side.FLAT:
@@ -301,6 +335,11 @@ class MT5Broker:
             return False, f"No tick/symbol info for {symbol}: {mt5.last_error()}", None
 
         price = tick.ask if signal.side == Side.BUY else tick.bid
+
+        # Pre-trade: market session + economic news blackout
+        pre_ok, pre_msg = self._pre_trade_guards(signal.pair)
+        if not pre_ok:
+            return False, pre_msg, None
 
         # Approximate daily loss % from floating profit vs balance
         bal = float(info["balance"]) or 1.0

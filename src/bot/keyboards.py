@@ -13,7 +13,8 @@ MAIN_ROWS = [
     [KeyboardButton("📐 Lot"), KeyboardButton("⏱ Interval")],
     [KeyboardButton("🤖 Auto ON"), KeyboardButton("⏸ Auto OFF")],
     [KeyboardButton("🔌 MT5"), KeyboardButton("📄 PDF")],
-    [KeyboardButton("🧹 Close all"), KeyboardButton("❓ Help")],
+    [KeyboardButton("📰 News"), KeyboardButton("❓ Help")],
+    [KeyboardButton("🧹 Close all")],
 ]
 
 LOT_ROWS = [
