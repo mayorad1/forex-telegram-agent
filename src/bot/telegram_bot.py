@@ -320,7 +320,13 @@ class ForexTelegramBot:
             await self._handle_confirm_reply(update, context, sess, text)
             return
 
-        # Bare number while idle → treat as lot size shortcut
+        # Interval keyboard labels: "15 min"
+        m_int = re.fullmatch(r"([0-9]{1,4})\s*min(?:ute)?s?", text.strip().lower())
+        if m_int:
+            await self._set_interval(update, m_int.group(1))
+            return
+
+        # Bare number while idle → lot size shortcut (0.01, 0.05, …)
         if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", text.strip()):
             await self._set_lot(update, text.strip())
             return
