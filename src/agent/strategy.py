@@ -267,12 +267,14 @@ class ForexAgent:
             if idea.take_profit is not None:
                 signal.take_profit = idea.take_profit
 
-        if mode == "pdf_priority":
-            # PDF direction wins; keep price/ATR from market
+        if mode in {"pdf_priority", "pdf_only"}:
+            # PDF direction is the trade; market price + ATR if PDF has no levels
             signal.side = pdf_side
-            signal.score = max(signal.score, int(self.strat.get("min_score", 2)))
-            signal.confidence = max(signal.confidence, idea.confidence)
-            if signal.stop_loss is None and signal.atr:
+            min_sc = int(self.strat.get("min_score", 2))
+            signal.score = max(signal.score, min_sc, int(self.pdf_cfg.get("pdf_score", min_sc)))
+            signal.confidence = max(signal.confidence, idea.confidence, 0.7)
+            signal.reasons.append(f"PDF-only/priority: following PDF {idea.side}")
+            if signal.stop_loss is None and signal.atr and signal.price:
                 mult_sl = float(self.strat.get("sl_atr_mult", 1.5))
                 mult_tp = float(self.strat.get("tp_atr_mult", 2.5))
                 if pdf_side == Side.BUY:

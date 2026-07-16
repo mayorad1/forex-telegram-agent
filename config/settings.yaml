@@ -1,16 +1,16 @@
-# Conservative profile — fewer trades, stricter filters (after drawdown)
+# PDF-only auto trading + unlimited trades (user preference)
 
 pairs:
   - EURUSD
   - GBPUSD
   - USDJPY
   - AUDUSD
-  # XAUUSD removed by default (very volatile); add back if you want gold
+  - USDCAD
+  - XAUUSD
 
 timeframe: "15m"
 history_period: "5d"
-# Higher timeframe trend filter
-htf_timeframe: "1h"
+htf_timeframe: null   # off while testing PDF-only
 htf_period: "60d"
 
 strategy:
@@ -23,53 +23,42 @@ strategy:
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9
-  # Need strong agreement (was 2 → too many weak trades)
-  min_score: 3
+  min_score: 1          # PDF path sets its own score
   atr_period: 14
-  # Tighter SL, wider TP → aim ~1:2 reward/risk
-  sl_atr_mult: 1.2
-  tp_atr_mult: 2.4
-  # Quality gates
-  require_macd_momentum: true
-  require_ema_macd_agree: true
-  require_price_vs_ema_slow: true
-  block_buy_if_rsi_overbought: true
-  block_sell_if_rsi_oversold: true
-  htf_ema_fast: 20
-  htf_ema_slow: 50
+  sl_atr_mult: 1.5
+  tp_atr_mult: 2.5
+  require_macd_momentum: false
+  require_ema_macd_agree: false
+  require_price_vs_ema_slow: false
+  block_buy_if_rsi_overbought: false
+  block_sell_if_rsi_oversold: false
 
 risk:
-  # Cap concurrent exposure (was unlimited)
-  max_open_positions: 2
-  risk_per_trade_pct: 0.5
-  # Stop trading after floating loss ~3% of balance
-  max_daily_loss_pct: 3.0
-  max_lot_size: 0.05
+  max_open_positions: 0     # 0 = unlimited
+  risk_per_trade_pct: 1.0
+  max_daily_loss_pct: 0     # 0 = off
+  max_lot_size: null
   min_lot_size: 0.01
-  # Keep small until edge is proven
   fixed_lot_size: 0.01
-  # Broker refuses weak signals even on manual "trade"
-  min_signal_score: 3
+  min_signal_score: 0       # allow PDF trades through broker
 
+# Default; change anytime in Telegram: "interval 5" / "every 30 min"
 scan_interval_minutes: 15
 auto_trade_on_start: true
 auto_trade_enabled: true
-# Only 1 new auto trade per cycle (was unlimited)
-max_new_trades_per_cycle: 1
+max_new_trades_per_cycle: 0  # 0 = unlimited per cycle
 
 pdf:
   enabled: true
-  mode: blend
+  mode: pdf_only            # trades ONLY from PDF ideas
+  pdf_score: 2
   score_boost: 1
   use_pdf_levels: true
-  # Don't open weak PDF-only trades
-  allow_pdf_when_flat: false
-  block_on_conflict: true
-  include_pdf_pairs: false
-  relax_min_score: false
+  allow_pdf_when_flat: true
+  block_on_conflict: false
+  include_pdf_pairs: true
+  relax_min_score: true
 
-# Skip dead / choppy hours (UTC). Adjust for your session.
-# Example: avoid 21:00–01:00 UTC rollover noise
 quiet_hours:
-  start_hour_utc: 21
-  end_hour_utc: 1
+  start_hour_utc: null
+  end_hour_utc: null

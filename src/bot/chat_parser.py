@@ -369,6 +369,21 @@ INTENT_PHRASES: list[tuple[str, list[str], bool]] = [
         ],
         False,
     ),
+    (
+        "interval",
+        [
+            "interval",
+            "every",
+            "minutes",
+            "timer",
+            "scan interval",
+            "trade interval",
+            "how often",
+            "frequency",
+            "cycle",
+        ],
+        False,
+    ),
 ]
 
 
@@ -472,6 +487,21 @@ def parse_chat(text: str) -> Optional[ChatIntent]:
     if lot_m:
         return ChatIntent("set_lot", arg=lot_m.group(1), raw=raw, matched="lot", confidence=1.0)
 
+    # Interval: "every 5 min", "interval 15", "30 minutes", "5 min"
+    int_m = re.search(
+        r"\b(?:every|interval|timer|cycle)\s*(?:to|=|:)?\s*([0-9]{1,4})\s*(?:m|min|mins|minute|minutes)?\b",
+        low,
+    )
+    if not int_m:
+        int_m = re.search(r"\b([0-9]{1,4})\s*(?:m|min|mins|minute|minutes)\b", low)
+    if int_m and (
+        re.search(r"\b(every|interval|timer|cycle|min|minute)\b", low)
+        or re.search(r"\b[0-9]{1,4}\s*min", low)
+    ):
+        return ChatIntent(
+            "set_interval", arg=int_m.group(1), raw=raw, matched="interval", confidence=1.0
+        )
+
     # Score all intent phrases
     best: Optional[tuple[float, str, str, bool]] = None  # score, intent, matched, needs_pair
 
@@ -530,6 +560,8 @@ def parse_chat(text: str) -> Optional[ChatIntent]:
 
     if intent_name == "lot":
         return ChatIntent("lot_menu", raw=raw, matched=matched)
+    if intent_name == "interval":
+        return ChatIntent("interval_menu", raw=raw, matched=matched)
 
     if intent_name in {"signal", "price", "trade", "close_pair"}:
         if not pair:
@@ -617,6 +649,9 @@ CHAT_EXAMPLES = """
 
 *Lot size*
 `lot` · `lot 0.05` · `set lot 0.1` · `0.02 lots`
+
+*Trade interval (auto)*
+`interval` · `every 5 min` · `interval 30` · `15 minutes`
 
 Typos are OK — I'll try to detect what you meant.
 """.strip()

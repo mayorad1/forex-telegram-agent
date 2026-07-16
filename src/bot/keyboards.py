@@ -10,7 +10,7 @@ MAIN_ROWS = [
     [KeyboardButton("📂 Positions"), KeyboardButton("💰 Status")],
     [KeyboardButton("🟢 Buy"), KeyboardButton("🔴 Sell")],
     [KeyboardButton("📋 Pairs"), KeyboardButton("💲 Price")],
-    [KeyboardButton("📐 Lot"), KeyboardButton("📏 Lot size")],
+    [KeyboardButton("📐 Lot"), KeyboardButton("⏱ Interval")],
     [KeyboardButton("🤖 Auto ON"), KeyboardButton("⏸ Auto OFF")],
     [KeyboardButton("🔌 MT5"), KeyboardButton("📄 PDF")],
     [KeyboardButton("🧹 Close all"), KeyboardButton("❓ Help")],
@@ -20,6 +20,13 @@ LOT_ROWS = [
     [KeyboardButton("0.01"), KeyboardButton("0.02"), KeyboardButton("0.05")],
     [KeyboardButton("0.10"), KeyboardButton("0.20"), KeyboardButton("0.50")],
     [KeyboardButton("1.00"), KeyboardButton("2.00"), KeyboardButton("5.00")],
+    [KeyboardButton("⬅️ Menu"), KeyboardButton("💰 Status")],
+]
+
+INTERVAL_ROWS = [
+    [KeyboardButton("1 min"), KeyboardButton("5 min"), KeyboardButton("10 min")],
+    [KeyboardButton("15 min"), KeyboardButton("30 min"), KeyboardButton("60 min")],
+    [KeyboardButton("120 min"), KeyboardButton("240 min"), KeyboardButton("360 min")],
     [KeyboardButton("⬅️ Menu"), KeyboardButton("💰 Status")],
 ]
 
@@ -50,6 +57,10 @@ def yes_no_keyboard() -> ReplyKeyboardMarkup:
 
 def lot_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(LOT_ROWS, resize_keyboard=True)
+
+
+def interval_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(INTERVAL_ROWS, resize_keyboard=True)
 
 
 def remove_keyboard() -> ReplyKeyboardRemove:

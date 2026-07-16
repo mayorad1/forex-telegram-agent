@@ -35,8 +35,14 @@ def main() -> None:
         sys.exit(1)
 
     settings = get_settings()
-    agent = ForexAgent(settings)
     from src.trading.lot_settings import apply_lot_to_risk_cfg
+    from src.utils.runtime_prefs import get_scan_interval_minutes
+
+    # Telegram-persisted interval override
+    settings["scan_interval_minutes"] = get_scan_interval_minutes(
+        int(settings.get("scan_interval_minutes", 15))
+    )
+    agent = ForexAgent(settings)
 
     risk_cfg = apply_lot_to_risk_cfg(dict(settings.get("risk", {})))
     settings["risk"] = risk_cfg
