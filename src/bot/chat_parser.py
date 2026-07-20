@@ -399,6 +399,20 @@ INTENT_PHRASES: list[tuple[str, list[str], bool]] = [
         ],
         False,
     ),
+    (
+        "patterns",
+        [
+            "patterns",
+            "pattern",
+            "candles",
+            "candle",
+            "learn",
+            "learning",
+            "history patterns",
+            "what patterns",
+        ],
+        False,
+    ),
 ]
 
 
@@ -579,6 +593,8 @@ def parse_chat(text: str) -> Optional[ChatIntent]:
         return ChatIntent("interval_menu", raw=raw, matched=matched)
     if intent_name == "news":
         return ChatIntent("news", pair=pair, raw=raw, matched=matched)
+    if intent_name == "patterns":
+        return ChatIntent("patterns", pair=pair, raw=raw, matched=matched)
 
     if intent_name in {"signal", "price", "trade", "close_pair"}:
         if not pair:

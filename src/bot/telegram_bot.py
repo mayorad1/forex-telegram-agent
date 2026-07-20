@@ -134,6 +134,7 @@ class ForexTelegramBot:
             ("lot", self.cmd_lot),
             ("interval", self.cmd_interval),
             ("news", self.cmd_news),
+            ("patterns", self.cmd_patterns),
         ]
         for name, fn in handlers:
             self.app.add_handler(CommandHandler(name, fn))
@@ -255,29 +256,25 @@ class ForexTelegramBot:
             self.alert_chat_id = update.effective_chat.id
         sess = self.sessions.get(self._uid(update))
         sess.clear_pending()
-        pdf_n = len(self.agent.pdf_book.ideas) if self.agent.pdf_book else 0
         mins = self._interval_minutes()
+        # Always restore PDF from disk on /start
+        self.agent.reload_pdf_book()
+        pdf_n = len(self.agent.pdf_book.ideas) if self.agent.pdf_book else 0
+        pdf_name = self.agent.pdf_book.source_name if self.agent.pdf_book else "none"
         await self._reply(
             update,
-            # Always restore PDF from disk on /start
-            self.agent.reload_pdf_book()
-            pdf_n = len(self.agent.pdf_book.ideas) if self.agent.pdf_book else 0
-            pdf_name = (
-                self.agent.pdf_book.source_name if self.agent.pdf_book else "none"
-            )
-            await self._reply(
-                update,
-                f"👋 *Trading agent ready*\n\n"
-                f"Before *every* trade I check:\n"
-                f"1. 📄 *PDF idea* (saved on disk — upload once)\n"
-                f"2. 📈 *Market tech* (must agree)\n"
-                f"3. 📰 *News* blackout check\n\n"
-                f"💾 Saved PDF: `{pdf_name}` · ideas: `{pdf_n}`\n"
-                f"_You don't need to re-send the PDF after restart._\n\n"
-                f"Auto: `{'ON' if self.auto_enabled else 'OFF'}` · every *{mins} min*\n"
-                f"MT5: `{'connected' if self.broker.connected else 'reconnect'}`",
-                main_keyboard(),
-            )
+            f"👋 *Trading agent ready*\n\n"
+            f"Before *every* trade I check:\n"
+            f"1. 📄 *PDF idea* if saved (optional)\n"
+            f"2. 📚 *Candle patterns* learned from history\n"
+            f"3. 📈 *Market tech* (EMA/MACD/RSI)\n"
+            f"4. 📰 *News* blackout check\n\n"
+            f"💾 Saved PDF: `{pdf_name}` · ideas: `{pdf_n}`\n"
+            f"_No PDF? Bot still trades from learned candle patterns._\n\n"
+            f"Auto: `{'ON' if self.auto_enabled else 'OFF'}` · every *{mins} min*\n"
+            f"MT5: `{'connected' if self.broker.connected else 'reconnect'}`",
+            main_keyboard(),
+        )
 
     async def cmd_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
@@ -557,6 +554,8 @@ class ForexTelegramBot:
             await self.cmd_pdf_help(update, context)
         elif name == "news":
             await self.cmd_news(update, context)
+        elif name == "patterns":
+            await self.cmd_patterns(update, context)
         elif name == "set_lot" and intent.arg:
             await self._set_lot(update, intent.arg)
         elif name == "lot_menu":
@@ -1094,6 +1093,37 @@ class ForexTelegramBot:
             interval_keyboard(),
         )
 
+    async def cmd_patterns(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show learned candle pattern view for a pair or all pairs."""
+        if not await self._auth(update):
+            return
+        from src.agent.pattern_learner import learn_from_candles
+        from src.data.market_data import fetch_ohlc
+
+        pair = None
+        if context.args:
+            pair = context.args[0].upper().replace("/", "")
+        pairs = [pair] if pair else list(self.settings.get("pairs", []))[:6]
+        await self._reply(update, "⏳ Studying candle history…", main_keyboard())
+        lines = ["*📚 Candle pattern learning*\n"]
+        cfg = self.settings.get("patterns") or {}
+        period = str(cfg.get("history_period", "30d"))
+        for p in pairs:
+            try:
+                df = fetch_ohlc(p, interval=self.settings.get("timeframe", "15m"), period=period)
+                hint = learn_from_candles(df, cfg)
+                mark = {"BUY": "🟢", "SELL": "🔴", "FLAT": "⚪"}.get(hint.side, "·")
+                lines.append(
+                    f"{mark} `{p}` → *{hint.side}* score={hint.score} "
+                    f"WR=`{hint.win_rate:.0%}` n=`{hint.samples}` ({hint.name})"
+                )
+                for r in hint.reasons[:2]:
+                    lines.append(f"   _{r[:90]}_")
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"· `{p}` error: {exc}")
+        lines.append("\n_Used when PDF has no idea for a pair._")
+        await self._reply(update, "\n".join(lines), main_keyboard())
+
     async def cmd_news(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
@@ -1224,11 +1254,12 @@ class ForexTelegramBot:
             lot = self.broker.risk_cfg.get("fixed_lot_size") or load_fixed_lot() or "?"
             pdf_mode = (self.settings.get("pdf") or {}).get("mode", "blend")
 
-            if pdf_mode in {"pdf_only", "pdf_market", "pdf_priority"} and pdf_n == 0:
+            allow_fb = bool((self.settings.get("pdf") or {}).get("allow_pattern_fallback", True))
+            if pdf_mode == "pdf_only" and pdf_n == 0 and not allow_fb:
                 await self._notify(
                     context,
                     f"⏱ *{mins}m cycle* — needs PDF\n"
-                    "❌ No PDF loaded. Send ideas like `EURUSD BUY SL … TP …`",
+                    "❌ No PDF loaded (pattern fallback off).",
                 )
                 return
 
@@ -1241,12 +1272,13 @@ class ForexTelegramBot:
             signals = self.agent.rank_for_trade(self.agent.actionable())
             lines = [
                 f"⏱ *{mins}m cycle* `{datetime.now(timezone.utc).strftime('%H:%M UTC')}`",
-                f"Filters: PDF+market+news · mode=`{pdf_mode}` · PDF=`{pdf_n}`",
-                f"Actionable: `{len(signals)}` · lot=`{lot}` · limit=`{'∞' if unlimited else max_new}`",
+                f"Filters: PDF (opt) + *candle patterns* + market + news",
+                f"mode=`{pdf_mode}` · PDF=`{pdf_n}` · actionable=`{len(signals)}`",
+                f"Lot=`{lot}` · limit=`{'∞' if unlimited else max_new}`",
             ]
             if not signals:
                 lines.append(
-                    "No trades — need PDF idea *and* market agreement *and* clear news window."
+                    "No trades — no PDF/pattern edge that also passes market + news."
                 )
                 await self._notify(context, "\n".join(lines))
                 return

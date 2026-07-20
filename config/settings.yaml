@@ -61,7 +61,7 @@ max_new_trades_per_cycle: 0  # unlimited
 
 pdf:
   enabled: true
-  # PDF idea REQUIRED + market tech must AGREE + news OK
+  # Prefer PDF+market when PDF has idea; if no PDF idea → pattern/tech fallback
   mode: pdf_market
   pdf_score: 2
   score_boost: 1
@@ -70,6 +70,21 @@ pdf:
   block_on_conflict: true
   include_pdf_pairs: true
   relax_min_score: false
+  # When pair not in PDF, still trade from candle learning + market
+  allow_pattern_fallback: true
+
+# Learn from old candles to predict entries (used when PDF has no idea)
+patterns:
+  enabled: true
+  history_period: "30d"       # longer history to study patterns
+  horizon_bars: 6             # look N candles ahead when scoring past patterns
+  sequence_length: 5          # fingerprint of last N candles
+  min_win_rate: 0.55          # require historical edge
+  min_samples: 8
+  min_pattern_score: 2
+  fill_when_flat: true        # enter from patterns if tech flat
+  agree_boost: 1
+  penalize_conflict: true
 
 quiet_hours:
   start_hour_utc: null

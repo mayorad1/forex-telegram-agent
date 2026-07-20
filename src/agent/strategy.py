@@ -9,6 +9,7 @@ from typing import Any, Optional
 import pandas as pd
 
 from src.agent.indicators import atr, ema, macd, rsi
+from src.agent.pattern_learner import learn_from_candles
 from src.agent.pdf_signals import (
     PdfSignalBook,
     ensure_pdf_loaded,
@@ -70,6 +71,7 @@ class ForexAgent:
         self.timeframe = settings.get("timeframe", "15m")
         self.period = settings.get("history_period", "5d")
         self.pdf_cfg = settings.get("pdf", {}) or {}
+        self.pattern_cfg = settings.get("patterns", {}) or {}
         watched = list(settings.get("pairs", []))
         self.pdf_book: Optional[PdfSignalBook] = ensure_pdf_loaded(watched=watched)
 
@@ -85,9 +87,79 @@ class ForexAgent:
         return self.pdf_book
 
     def analyze_pair(self, pair: str) -> Signal:
-        df = fetch_ohlc(pair, interval=self.timeframe, period=self.period)
+        # Longer history helps pattern learning
+        hist = self.settings.get("pattern_history_period") or self.period
+        if bool(self.pattern_cfg.get("enabled", True)):
+            hist = self.pattern_cfg.get("history_period", hist)
+        df = fetch_ohlc(pair, interval=self.timeframe, period=str(hist))
         sig = self.analyze_df(pair, df)
+        sig = self.apply_pattern_learning(sig, df)
         return self.apply_pdf_bias(sig)
+
+    def apply_pattern_learning(self, signal: Signal, df: pd.DataFrame) -> Signal:
+        """Score candle patterns using historical outcomes; fill gaps when tech is weak."""
+        if not bool(self.pattern_cfg.get("enabled", True)):
+            return signal
+        try:
+            hint = learn_from_candles(df, self.pattern_cfg)
+        except Exception as exc:  # noqa: BLE001
+            signal.reasons.append(f"Pattern learn skip: {exc}")
+            return signal
+
+        for r in hint.reasons[:6]:
+            signal.reasons.append(f"📚 {r}")
+
+        if hint.side == "FLAT":
+            return signal
+
+        min_wr = float(self.pattern_cfg.get("min_win_rate", 0.55))
+        # Boost when pattern agrees with tech
+        if signal.side.value == hint.side:
+            boost = int(self.pattern_cfg.get("agree_boost", 1))
+            signal.score += boost
+            signal.confidence = min(1.0, signal.confidence + 0.1 + hint.confidence * 0.2)
+            signal.reasons.append(
+                f"Pattern agrees ({hint.name} WR={hint.win_rate:.0%}) +{boost}"
+            )
+            return signal
+
+        # Tech flat → allow pattern entry (PDF may still apply later)
+        allow_fill = bool(self.pattern_cfg.get("fill_when_flat", True))
+        if signal.side == Side.FLAT and allow_fill and hint.score >= int(
+            self.pattern_cfg.get("min_pattern_score", 2)
+        ):
+            if hint.win_rate > 0 and hint.win_rate < min_wr and hint.samples >= int(
+                self.pattern_cfg.get("min_samples", 10)
+            ):
+                signal.reasons.append("Pattern fill blocked — low historical WR")
+                return signal
+            signal.side = Side.BUY if hint.side == "BUY" else Side.SELL
+            signal.score = max(hint.score, int(self.strat.get("min_score", 2)))
+            signal.confidence = max(signal.confidence, hint.confidence)
+            signal.reasons.append(
+                f"Pattern entry: {hint.name} → {hint.side} (learned WR={hint.win_rate:.0%} n={hint.samples})"
+            )
+            # SL/TP from ATR if missing
+            if signal.stop_loss is None and signal.atr and signal.price:
+                sl_m = float(self.strat.get("sl_atr_mult", 1.5))
+                tp_m = float(self.strat.get("tp_atr_mult", 2.5))
+                if signal.side == Side.BUY:
+                    signal.stop_loss = signal.price - signal.atr * sl_m
+                    signal.take_profit = signal.price + signal.atr * tp_m
+                else:
+                    signal.stop_loss = signal.price + signal.atr * sl_m
+                    signal.take_profit = signal.price - signal.atr * tp_m
+            return signal
+
+        # Conflict with tech — optional soft penalty
+        if signal.side != Side.FLAT and hint.side != signal.side.value:
+            if bool(self.pattern_cfg.get("penalize_conflict", True)):
+                signal.score = max(0, signal.score - 1)
+                signal.reasons.append(f"Pattern conflicts ({hint.side}) — score -1")
+                if signal.score == 0:
+                    signal.side = Side.FLAT
+                    signal.confidence = 0.0
+        return signal
 
     def analyze_df(self, pair: str, df: pd.DataFrame) -> Signal:
         s = self.strat
@@ -256,11 +328,19 @@ class ForexAgent:
         boost = int(self.pdf_cfg.get("score_boost", 1))
 
         if idea is None:
-            if mode == "pdf_only":
+            if mode == "pdf_only" and not bool(self.pdf_cfg.get("allow_pattern_fallback", True)):
                 signal.side = Side.FLAT
                 signal.score = 0
                 signal.confidence = 0.0
                 signal.reasons.append("PDF-only mode: no idea for this pair")
+            elif mode in {"pdf_only", "pdf_market"} and bool(
+                self.pdf_cfg.get("allow_pattern_fallback", True)
+            ):
+                # Keep tech/pattern signal so we can trade without PDF
+                if signal.side != Side.FLAT:
+                    signal.reasons.append("No PDF idea — using market + learned candle patterns")
+                else:
+                    signal.reasons.append("No PDF idea and no pattern/tech edge")
             return signal
 
         pdf_side = Side.BUY if idea.side.upper() == "BUY" else Side.SELL
