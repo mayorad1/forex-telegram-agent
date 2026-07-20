@@ -43,6 +43,14 @@ def main() -> None:
         int(settings.get("scan_interval_minutes", 15))
     )
     agent = ForexAgent(settings)
+    if agent.pdf_book and agent.pdf_book.ideas:
+        logger.info(
+            "Restored saved PDF: %s (%s ideas) — no re-upload needed",
+            agent.pdf_book.source_name,
+            len(agent.pdf_book.ideas),
+        )
+    else:
+        logger.info("No saved PDF yet — send one in Telegram once; it will be kept on disk")
 
     risk_cfg = apply_lot_to_risk_cfg(dict(settings.get("risk", {})))
     settings["risk"] = risk_cfg

@@ -271,7 +271,14 @@ def parse_trade_ideas(text: str, watched: Optional[list[str]] = None) -> list[Pd
     return list(ideas.values())
 
 
+# Permanent storage (survives bot restarts — no need to re-upload every time)
+SAVED_PDF_PATH = RUNTIME_DIR / "saved_research.pdf"
+SIGNALS_JSON = RUNTIME_DIR / "pdf_signals.json"
+META_JSON = RUNTIME_DIR / "pdf_meta.json"
+
+
 def load_pdf_book(path: Path, source_name: str, watched: Optional[list[str]] = None) -> PdfSignalBook:
+    """Parse a PDF, extract ideas, and persist file + ideas for future restarts."""
     text = extract_text_from_pdf(path)
     ideas = parse_trade_ideas(text, watched=watched)
     book = PdfSignalBook(
@@ -281,7 +288,29 @@ def load_pdf_book(path: Path, source_name: str, watched: Optional[list[str]] = N
         ideas=ideas,
         raw_preview=text[:500].replace("\n", " "),
     )
+    # Keep a permanent copy of the PDF on disk
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        data = path.read_bytes()
+        SAVED_PDF_PATH.write_bytes(data)
+        (RUNTIME_DIR / "last_upload.pdf").write_bytes(data)
+    except Exception:  # noqa: BLE001
+        # if path is already saved_research, still OK
+        if path.resolve() != SAVED_PDF_PATH.resolve() and path.exists():
+            import shutil
+
+            shutil.copy2(path, SAVED_PDF_PATH)
+
     save_book(book)
+    _save_meta(
+        {
+            "source_name": source_name,
+            "saved_pdf": str(SAVED_PDF_PATH),
+            "loaded_at": book.loaded_at,
+            "ideas_count": len(ideas),
+            "text_chars": book.text_chars,
+        }
+    )
     return book
 
 
@@ -293,31 +322,88 @@ def save_book(book: PdfSignalBook) -> None:
         "text_chars": book.text_chars,
         "raw_preview": book.raw_preview,
         "ideas": [asdict(i) for i in book.ideas],
+        "saved_pdf": str(SAVED_PDF_PATH) if SAVED_PDF_PATH.exists() else "",
     }
-    (RUNTIME_DIR / "pdf_signals.json").write_text(
-        json.dumps(payload, indent=2), encoding="utf-8"
-    )
+    SIGNALS_JSON.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _save_meta(meta: dict[str, Any]) -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    META_JSON.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def load_meta() -> dict[str, Any]:
+    if not META_JSON.exists():
+        return {}
+    try:
+        return json.loads(META_JSON.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def load_saved_book() -> Optional[PdfSignalBook]:
-    path = RUNTIME_DIR / "pdf_signals.json"
-    if not path.exists():
-        return None
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        ideas = [PdfTradeIdea(**i) for i in raw.get("ideas", [])]
-        return PdfSignalBook(
-            source_name=raw.get("source_name", ""),
-            loaded_at=raw.get("loaded_at", ""),
-            text_chars=int(raw.get("text_chars", 0)),
-            ideas=ideas,
-            raw_preview=raw.get("raw_preview", ""),
-        )
-    except Exception:  # noqa: BLE001
-        return None
+    """Load previously saved PDF ideas from disk (no re-upload needed)."""
+    if SIGNALS_JSON.exists():
+        try:
+            raw = json.loads(SIGNALS_JSON.read_text(encoding="utf-8"))
+            ideas = [PdfTradeIdea(**i) for i in raw.get("ideas", [])]
+            if ideas:
+                return PdfSignalBook(
+                    source_name=raw.get("source_name", ""),
+                    loaded_at=raw.get("loaded_at", ""),
+                    text_chars=int(raw.get("text_chars", 0)),
+                    ideas=ideas,
+                    raw_preview=raw.get("raw_preview", ""),
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Fallback: re-parse permanent PDF file if JSON missing/empty
+    if SAVED_PDF_PATH.exists():
+        try:
+            meta = load_meta()
+            name = meta.get("source_name") or "saved_research.pdf"
+            return load_pdf_book(SAVED_PDF_PATH, source_name=name)
+        except Exception:  # noqa: BLE001
+            return None
+    return None
 
 
-def clear_book() -> None:
-    path = RUNTIME_DIR / "pdf_signals.json"
-    if path.exists():
-        path.unlink()
+def ensure_pdf_loaded(watched: Optional[list[str]] = None) -> Optional[PdfSignalBook]:
+    """
+    Always try to restore saved PDF/ideas.
+    Call on bot startup and each auto-cycle.
+    """
+    book = load_saved_book()
+    if book and book.ideas:
+        return book
+    if SAVED_PDF_PATH.exists():
+        try:
+            meta = load_meta()
+            name = meta.get("source_name") or SAVED_PDF_PATH.name
+            return load_pdf_book(SAVED_PDF_PATH, source_name=name, watched=watched)
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def has_saved_pdf() -> bool:
+    if SAVED_PDF_PATH.exists():
+        return True
+    book = load_saved_book()
+    return bool(book and book.ideas)
+
+
+def clear_book(delete_pdf_file: bool = False) -> None:
+    """Clear saved ideas. Optionally delete the permanent PDF file too."""
+    for p in (SIGNALS_JSON, META_JSON, RUNTIME_DIR / "last_upload.pdf"):
+        if p.exists():
+            try:
+                p.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+    if delete_pdf_file and SAVED_PDF_PATH.exists():
+        try:
+            SAVED_PDF_PATH.unlink()
+        except Exception:  # noqa: BLE001
+            pass

@@ -9,7 +9,11 @@ from typing import Any, Optional
 import pandas as pd
 
 from src.agent.indicators import atr, ema, macd, rsi
-from src.agent.pdf_signals import PdfSignalBook, PdfTradeIdea, load_saved_book
+from src.agent.pdf_signals import (
+    PdfSignalBook,
+    ensure_pdf_loaded,
+    load_saved_book,
+)
 from src.data.market_data import fetch_ohlc
 
 
@@ -66,13 +70,18 @@ class ForexAgent:
         self.timeframe = settings.get("timeframe", "15m")
         self.period = settings.get("history_period", "5d")
         self.pdf_cfg = settings.get("pdf", {}) or {}
-        self.pdf_book: Optional[PdfSignalBook] = load_saved_book()
+        watched = list(settings.get("pairs", []))
+        self.pdf_book: Optional[PdfSignalBook] = ensure_pdf_loaded(watched=watched)
 
     def set_pdf_book(self, book: Optional[PdfSignalBook]) -> None:
         self.pdf_book = book
 
     def reload_pdf_book(self) -> Optional[PdfSignalBook]:
-        self.pdf_book = load_saved_book()
+        """Reload from permanent disk storage (saved PDF / json)."""
+        watched = list(self.settings.get("pairs", []))
+        self.pdf_book = ensure_pdf_loaded(watched=watched)
+        if self.pdf_book is None:
+            self.pdf_book = load_saved_book()
         return self.pdf_book
 
     def analyze_pair(self, pair: str) -> Signal:

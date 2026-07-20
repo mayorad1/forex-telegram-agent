@@ -17,7 +17,14 @@ from telegram.ext import (
     filters,
 )
 
-from src.agent.pdf_signals import clear_book, load_pdf_book, load_saved_book
+from src.agent.pdf_signals import (
+    clear_book,
+    ensure_pdf_loaded,
+    has_saved_pdf,
+    load_meta,
+    load_pdf_book,
+    load_saved_book,
+)
 from src.agent.strategy import ForexAgent, Side, Signal
 from src.bot.chat_parser import CHAT_EXAMPLES, ChatIntent, extract_pair, parse_chat
 from src.bot.keyboards import (
@@ -252,17 +259,25 @@ class ForexTelegramBot:
         mins = self._interval_minutes()
         await self._reply(
             update,
-            f"👋 *Trading agent ready*\n\n"
-            f"Before *every* trade I check:\n"
-            f"1. 📄 *PDF idea* (must exist)\n"
-            f"2. 📈 *Market tech* (must agree with PDF)\n"
-            f"3. 📰 *News* (no high-impact blackout)\n\n"
-            f"• Send a PDF · `news` · `interval 15` · `lot 0.01`\n"
-            f"• Unlimited positions · every *{mins} min*\n\n"
-            f"Auto: `{'ON' if self.auto_enabled else 'OFF'}` · PDF ideas: `{pdf_n}`\n"
-            f"MT5: `{'connected' if self.broker.connected else 'reconnect'}`",
-            main_keyboard(),
-        )
+            # Always restore PDF from disk on /start
+            self.agent.reload_pdf_book()
+            pdf_n = len(self.agent.pdf_book.ideas) if self.agent.pdf_book else 0
+            pdf_name = (
+                self.agent.pdf_book.source_name if self.agent.pdf_book else "none"
+            )
+            await self._reply(
+                update,
+                f"👋 *Trading agent ready*\n\n"
+                f"Before *every* trade I check:\n"
+                f"1. 📄 *PDF idea* (saved on disk — upload once)\n"
+                f"2. 📈 *Market tech* (must agree)\n"
+                f"3. 📰 *News* blackout check\n\n"
+                f"💾 Saved PDF: `{pdf_name}` · ideas: `{pdf_n}`\n"
+                f"_You don't need to re-send the PDF after restart._\n\n"
+                f"Auto: `{'ON' if self.auto_enabled else 'OFF'}` · every *{mins} min*\n"
+                f"MT5: `{'connected' if self.broker.connected else 'reconnect'}`",
+                main_keyboard(),
+            )
 
     async def cmd_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
@@ -1001,32 +1016,51 @@ class ForexTelegramBot:
     async def cmd_pdf_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
+        saved = "yes" if has_saved_pdf() else "no"
+        meta = load_meta()
+        name = meta.get("source_name") or "—"
         await self._reply(
             update,
-            "📄 *PDF mode*\n"
-            "1. Send a PDF file here\n"
-            "2. I extract BUY/SELL ideas\n"
-            "3. Say `pdf signals` or `pdf trade`\n\n"
-            "Best format: `EURUSD BUY SL 1.08 TP 1.10`",
+            "📄 *PDF mode* (saved on disk)\n"
+            "1. Send a PDF *once* — it is stored permanently\n"
+            "2. Bot reloads it after every restart\n"
+            "3. Only send again to *replace* the research file\n\n"
+            f"Saved now: `{saved}` · file: `{name}`\n\n"
+            "`pdf signals` · `pdf trade` · `pdf clear`\n"
+            "Format: `EURUSD BUY SL 1.08 TP 1.10`",
             main_keyboard(),
         )
 
     async def cmd_pdfsignals(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
-        book = self.agent.pdf_book or load_saved_book()
+        book = self.agent.reload_pdf_book() or load_saved_book() or ensure_pdf_loaded(
+            list(self.settings.get("pairs", []))
+        )
         self.agent.pdf_book = book
-        if not book:
-            await self._reply(update, "No PDF loaded. Send a PDF file.", main_keyboard())
+        if not book or not book.ideas:
+            await self._reply(
+                update,
+                "No saved PDF yet. Send a PDF file once — I'll keep it for next time.",
+                main_keyboard(),
+            )
             return
-        await self._reply(update, book.summary(), main_keyboard())
+        await self._reply(
+            update,
+            f"💾 *Using saved PDF* (no re-upload needed)\n\n{book.summary()}",
+            main_keyboard(),
+        )
 
     async def cmd_pdfclear(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
             return
-        clear_book()
+        clear_book(delete_pdf_file=True)
         self.agent.set_pdf_book(None)
-        await self._reply(update, "PDF ideas cleared.", main_keyboard())
+        await self._reply(
+            update,
+            "🗑 Saved PDF + ideas *deleted*.\nSend a new PDF when you want signals again.",
+            main_keyboard(),
+        )
 
     async def cmd_lot(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._auth(update):
@@ -1152,8 +1186,12 @@ class ForexTelegramBot:
                 return
             await self._reply(
                 update,
-                f"✅ Loaded *{len(book.ideas)}* idea(s)\n\n{book.summary()}\n\n"
-                "Say `pdf trade` or wait for auto cycle.",
+                f"✅ *PDF saved permanently*\n"
+                f"File kept on this PC — you do *not* need to upload again after restart.\n\n"
+                f"*{len(book.ideas)}* idea(s) from `{book.source_name}`\n\n"
+                f"{book.summary()}\n\n"
+                "Send a new PDF anytime to *replace* it.\n"
+                "`pdf signals` · `pdf trade` · `pdf clear` (removes saved file)",
                 main_keyboard(),
             )
         except Exception as exc:  # noqa: BLE001
