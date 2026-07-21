@@ -87,14 +87,84 @@ class ForexAgent:
         return self.pdf_book
 
     def analyze_pair(self, pair: str) -> Signal:
-        # Longer history helps pattern learning
+        # Entry TF (faster) + optional trend TF
+        entry_tf = str(self.settings.get("entry_timeframe") or self.timeframe or "15m")
         hist = self.settings.get("pattern_history_period") or self.period
         if bool(self.pattern_cfg.get("enabled", True)):
             hist = self.pattern_cfg.get("history_period", hist)
-        df = fetch_ohlc(pair, interval=self.timeframe, period=str(hist))
-        sig = self.analyze_df(pair, df)
+        df = fetch_ohlc(pair, interval=entry_tf, period=str(hist))
+        # temporarily point analyze_df timeframe label
+        old_tf = self.timeframe
+        self.timeframe = entry_tf
+        try:
+            sig = self.analyze_df(pair, df)
+        finally:
+            self.timeframe = old_tf
+        sig = self.apply_trend_tf_bias(sig, pair)
         sig = self.apply_pattern_learning(sig, df)
         return self.apply_pdf_bias(sig)
+
+    def apply_trend_tf_bias(self, signal: Signal, pair: str) -> Signal:
+        """Use higher TF as bias (boost/penalize) instead of hard-kill by default."""
+        trend_tf = self.settings.get("trend_timeframe") or self.settings.get("htf_timeframe")
+        if not trend_tf:
+            return signal
+        hard = bool(self.strat.get("htf_hard_block", False))
+        try:
+            tdf = fetch_ohlc(
+                pair,
+                interval=str(trend_tf),
+                period=str(self.settings.get("htf_period", "60d")),
+            )
+            tc = tdf["close"]
+            f_n = int(self.strat.get("htf_ema_fast", 20))
+            s_n = int(self.strat.get("htf_ema_slow", 50))
+            hf = float(ema(tc, f_n).iloc[-1])
+            hs = float(ema(tc, s_n).iloc[-1])
+            bull = hf > hs
+            if bull:
+                signal.reasons.append(f"Trend TF {trend_tf}: bullish")
+                if signal.side == Side.BUY:
+                    signal.score += 1
+                    signal.confidence = min(1.0, signal.confidence + 0.1)
+                    signal.reasons.append("Trend TF boosts LONG +1")
+                elif signal.side == Side.SELL:
+                    if hard:
+                        signal.reasons.append(f"Blocked: fighting {trend_tf} uptrend")
+                        signal.side, signal.score, signal.confidence = Side.FLAT, 0, 0.0
+                    else:
+                        signal.score = max(0, signal.score - 1)
+                        signal.reasons.append("Against HTF uptrend — score -1")
+                        if signal.score == 0:
+                            signal.side = Side.FLAT
+                elif signal.side == Side.FLAT and bool(self.strat.get("htf_fill_longs", True)):
+                    # Pullback long bias when higher TF bullish
+                    signal.side = Side.BUY
+                    signal.score = max(1, int(self.strat.get("min_score", 1)))
+                    signal.confidence = 0.45
+                    signal.reasons.append(f"HTF {trend_tf} bullish → allow LONG bias")
+                    if signal.atr and signal.price and signal.stop_loss is None:
+                        sl_m = float(self.strat.get("sl_atr_mult", 1.5))
+                        tp_m = float(self.strat.get("tp_atr_mult", 2.5))
+                        signal.stop_loss = signal.price - signal.atr * sl_m
+                        signal.take_profit = signal.price + signal.atr * tp_m
+            else:
+                signal.reasons.append(f"Trend TF {trend_tf}: bearish")
+                if signal.side == Side.SELL:
+                    signal.score += 1
+                    signal.reasons.append("Trend TF boosts SHORT +1")
+                elif signal.side == Side.BUY:
+                    if hard:
+                        signal.reasons.append(f"Blocked: fighting {trend_tf} downtrend")
+                        signal.side, signal.score, signal.confidence = Side.FLAT, 0, 0.0
+                    else:
+                        signal.score = max(0, signal.score - 1)
+                        signal.reasons.append("Against HTF downtrend — score -1")
+                        if signal.score == 0:
+                            signal.side = Side.FLAT
+        except Exception as exc:  # noqa: BLE001
+            signal.reasons.append(f"Trend TF skip: {exc}")
+        return signal
 
     def apply_pattern_learning(self, signal: Signal, df: pd.DataFrame) -> Signal:
         """Score candle patterns using historical outcomes; fill gaps when tech is weak."""
@@ -112,7 +182,7 @@ class ForexAgent:
         if hint.side == "FLAT":
             return signal
 
-        min_wr = float(self.pattern_cfg.get("min_win_rate", 0.55))
+        min_wr = float(self.pattern_cfg.get("min_win_rate", 0.48))
         # Boost when pattern agrees with tech
         if signal.side.value == hint.side:
             boost = int(self.pattern_cfg.get("agree_boost", 1))
@@ -125,17 +195,21 @@ class ForexAgent:
 
         # Tech flat → allow pattern entry (PDF may still apply later)
         allow_fill = bool(self.pattern_cfg.get("fill_when_flat", True))
-        if signal.side == Side.FLAT and allow_fill and hint.score >= int(
-            self.pattern_cfg.get("min_pattern_score", 2)
-        ):
-            if hint.win_rate > 0 and hint.win_rate < min_wr and hint.samples >= int(
-                self.pattern_cfg.get("min_samples", 10)
+        min_pat = int(self.pattern_cfg.get("min_pattern_score", 1))
+        if signal.side == Side.FLAT and allow_fill and hint.score >= min_pat:
+            # Only hard-skip if many samples AND clearly bad WR
+            hard_min_n = int(self.pattern_cfg.get("min_samples", 8))
+            if (
+                hint.samples >= hard_min_n
+                and hint.win_rate > 0
+                and hint.win_rate < min_wr
+                and not bool(self.pattern_cfg.get("allow_weak_patterns", True))
             ):
                 signal.reasons.append("Pattern fill blocked — low historical WR")
                 return signal
             signal.side = Side.BUY if hint.side == "BUY" else Side.SELL
-            signal.score = max(hint.score, int(self.strat.get("min_score", 2)))
-            signal.confidence = max(signal.confidence, hint.confidence)
+            signal.score = max(hint.score, int(self.strat.get("min_score", 1)))
+            signal.confidence = max(signal.confidence, hint.confidence, 0.4)
             signal.reasons.append(
                 f"Pattern entry: {hint.name} → {hint.side} (learned WR={hint.win_rate:.0%} n={hint.samples})"
             )
@@ -202,43 +276,57 @@ class ForexAgent:
             sell_score += 1
             reasons.append(f"EMA{ema_fast_n} < EMA{ema_slow_n} (bearish trend)")
 
-        # RSI — only count extreme zones that align with pullback logic
-        # (oversold only helps BUY if trend not strongly bearish when require_alignment)
+        # RSI — extremes + mild trend-aligned bias in mid range
         if rsi_v < rsi_os:
             buy_score += 1
             reasons.append(f"RSI oversold ({rsi_v:.1f})")
         elif rsi_v > rsi_ob:
             sell_score += 1
             reasons.append(f"RSI overbought ({rsi_v:.1f})")
+        elif rsi_v >= 50 and ef > es:
+            buy_score += 1
+            reasons.append(f"RSI supportive of longs ({rsi_v:.1f})")
+        elif rsi_v <= 50 and ef < es:
+            sell_score += 1
+            reasons.append(f"RSI supportive of shorts ({rsi_v:.1f})")
         else:
             reasons.append(f"RSI neutral-ish ({rsi_v:.1f})")
 
-        # MACD — require histogram on correct side (no weak "just positive")
-        require_macd_rising = bool(s.get("require_macd_momentum", True))
-        if require_macd_rising:
-            if mh > 0 and mh >= mh_prev:
-                buy_score += 1
-                reasons.append("MACD hist ≥0 and not fading")
-            elif mh < 0 and mh <= mh_prev:
-                sell_score += 1
-                reasons.append("MACD hist ≤0 and not fading")
-            else:
-                reasons.append("MACD momentum unclear")
+        # MACD — default soft (hist side is enough; rising is bonus)
+        require_macd_rising = bool(s.get("require_macd_momentum", False))
+        if mh > 0:
+            buy_score += 1
+            reasons.append("MACD hist positive")
+            if mh >= mh_prev:
+                buy_score += 1 if require_macd_rising else 0
+                if mh >= mh_prev:
+                    reasons.append("MACD hist rising")
+        elif mh < 0:
+            sell_score += 1
+            reasons.append("MACD hist negative")
+            if mh <= mh_prev:
+                sell_score += 1 if require_macd_rising else 0
+                if mh <= mh_prev:
+                    reasons.append("MACD hist falling")
         else:
-            if mh > 0:
-                buy_score += 1
-                reasons.append("MACD hist positive")
-            elif mh < 0:
-                sell_score += 1
-                reasons.append("MACD hist negative")
+            reasons.append("MACD flat")
 
-        # Optional: price vs slow EMA filter (trend quality)
-        if bool(s.get("require_price_vs_ema_slow", True)):
-            if price > es:
-                buy_score += 0  # soft — used only as veto below
-                reasons.append("Price above slow EMA")
-            elif price < es:
-                reasons.append("Price below slow EMA")
+        # Price vs slow EMA adds a point (trend following)
+        if price > es:
+            buy_score += 1
+            reasons.append("Price above slow EMA (long bias)")
+        elif price < es:
+            sell_score += 1
+            reasons.append("Price below slow EMA (short bias)")
+
+        # Momentum: last close vs previous
+        if len(close) >= 2:
+            if float(close.iloc[-1]) > float(close.iloc[-2]):
+                buy_score += 1
+                reasons.append("Last candle green")
+            elif float(close.iloc[-1]) < float(close.iloc[-2]):
+                sell_score += 1
+                reasons.append("Last candle red")
 
         if buy_score > sell_score:
             side = Side.BUY
@@ -251,26 +339,31 @@ class ForexAgent:
             score = 0
             reasons.append("No clear edge — stay flat")
 
-        # Hard quality filters (reduce chop / counter-trend traps)
-        if side != Side.FLAT and bool(s.get("require_ema_macd_agree", True)):
+        # Soft agreement: prefer EMA+MACD same side but do NOT hard-block by default
+        if side != Side.FLAT and bool(s.get("require_ema_macd_agree", False)):
             ema_bull = ef > es
             macd_bull = mh > 0
             if side == Side.BUY and not (ema_bull and macd_bull):
-                reasons.append("Blocked: BUY needs bullish EMA + MACD")
-                side, score = Side.FLAT, 0
+                reasons.append("Soft: BUY without full EMA+MACD — score -1")
+                score = max(0, score - 1)
+                if score == 0:
+                    side = Side.FLAT
             elif side == Side.SELL and not ((not ema_bull) and (not macd_bull)):
-                reasons.append("Blocked: SELL needs bearish EMA + MACD")
-                side, score = Side.FLAT, 0
+                reasons.append("Soft: SELL without full EMA+MACD — score -1")
+                score = max(0, score - 1)
+                if score == 0:
+                    side = Side.FLAT
 
-        if side == Side.BUY and bool(s.get("block_buy_if_rsi_overbought", True)) and rsi_v > rsi_ob:
+        # Only block extreme RSI exhaustion (optional hard)
+        if side == Side.BUY and bool(s.get("block_buy_if_rsi_overbought", False)) and rsi_v > rsi_ob:
             reasons.append("Blocked: RSI already overbought for BUY")
             side, score = Side.FLAT, 0
-        if side == Side.SELL and bool(s.get("block_sell_if_rsi_oversold", True)) and rsi_v < rsi_os:
+        if side == Side.SELL and bool(s.get("block_sell_if_rsi_oversold", False)) and rsi_v < rsi_os:
             reasons.append("Blocked: RSI already oversold for SELL")
             side, score = Side.FLAT, 0
 
-        # Higher-timeframe trend filter (e.g. 1h)
-        htf = s.get("htf_timeframe") or self.settings.get("htf_timeframe")
+        # Legacy hard HTF block only if enabled (prefer apply_trend_tf_bias soft path)
+        htf = s.get("htf_timeframe") if bool(s.get("htf_hard_block", False)) else None
         if side != Side.FLAT and htf:
             try:
                 htf_df = fetch_ohlc(pair, interval=str(htf), period=self.settings.get("htf_period", "30d"))
@@ -280,10 +373,10 @@ class ForexAgent:
                 hf = float(ema(htf_close, htf_fast).iloc[-1])
                 hs = float(ema(htf_close, htf_slow).iloc[-1])
                 if side == Side.BUY and hf < hs:
-                    reasons.append(f"Blocked: HTF {htf} bearish (EMA{htf_fast}<EMA{htf_slow})")
+                    reasons.append(f"Blocked: HTF {htf} bearish")
                     side, score = Side.FLAT, 0
                 elif side == Side.SELL and hf > hs:
-                    reasons.append(f"Blocked: HTF {htf} bullish (EMA{htf_fast}>EMA{htf_slow})")
+                    reasons.append(f"Blocked: HTF {htf} bullish")
                     side, score = Side.FLAT, 0
                 else:
                     reasons.append(f"HTF {htf} aligned")

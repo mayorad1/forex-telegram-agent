@@ -1,4 +1,4 @@
-# PDF ideas + market confirmation + news check (unlimited trades)
+# Multi-TF trend follow — catch more good LONGs (still news-checked)
 
 pairs:
   - EURUSD
@@ -8,83 +8,85 @@ pairs:
   - USDCAD
   - XAUUSD
 
-timeframe: "15m"
-history_period: "5d"
-htf_timeframe: "1h"
-htf_period: "60d"
+# Faster entries, higher TF for trend bias
+entry_timeframe: "5m"     # entries / pattern / signals
+timeframe: "5m"
+trend_timeframe: "15m"    # bias longs when 15m bullish
+history_period: "10d"
+htf_timeframe: "15m"      # used as soft trend (not hard block)
+htf_period: "30d"
 
 strategy:
   name: "multi_indicator"
   rsi_period: 14
-  rsi_oversold: 30
-  rsi_overbought: 70
+  rsi_oversold: 35
+  rsi_overbought: 65
   ema_fast: 9
   ema_slow: 21
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9
-  min_score: 2
+  min_score: 1              # take clear lean, not only perfect scores
   atr_period: 14
   sl_atr_mult: 1.5
   tp_atr_mult: 2.5
-  # Market structure quality
-  require_macd_momentum: true
-  require_ema_macd_agree: true
-  require_price_vs_ema_slow: true
-  block_buy_if_rsi_overbought: true
-  block_sell_if_rsi_oversold: true
-  htf_ema_fast: 20
-  htf_ema_slow: 50
+  # Soft filters so good longs are not wiped out
+  require_macd_momentum: false
+  require_ema_macd_agree: false
+  require_price_vs_ema_slow: false
+  block_buy_if_rsi_overbought: false
+  block_sell_if_rsi_oversold: false
+  htf_hard_block: false     # soft bias only
+  htf_fill_longs: true      # if flat but 15m bullish → allow LONG bias
+  htf_ema_fast: 9
+  htf_ema_slow: 21
 
 risk:
-  max_open_positions: 0      # unlimited
+  max_open_positions: 0
   risk_per_trade_pct: 1.0
   max_daily_loss_pct: 0
   max_lot_size: null
   min_lot_size: 0.01
   fixed_lot_size: 0.01
-  min_signal_score: 2
-  # News / session (checked on EVERY order)
+  min_signal_score: 1
   news:
     enabled: true
-    min_impact: High           # block High-impact only (or Medium)
-    block_minutes_before: 30   # minutes before release
-    block_minutes_after: 15    # minutes after release
-    avoid_rollover: true       # skip thin UTC 21–00 window
-    prefer_london_ny: false    # set true to only trade London/NY hours
-    fail_closed: false         # if calendar API fails, still allow trades
+    min_impact: High
+    block_minutes_before: 20
+    block_minutes_after: 10
+    avoid_rollover: true
+    prefer_london_ny: false
+    fail_closed: false
 
-scan_interval_minutes: 15
+scan_interval_minutes: 5
 auto_trade_on_start: true
 auto_trade_enabled: true
-max_new_trades_per_cycle: 0  # unlimited
+max_new_trades_per_cycle: 0
 
 pdf:
   enabled: true
-  # Prefer PDF+market when PDF has idea; if no PDF idea → pattern/tech fallback
-  mode: pdf_market
+  mode: blend                 # PDF boosts when present; not required
   pdf_score: 2
   score_boost: 1
   use_pdf_levels: true
-  allow_pdf_when_flat: false
-  block_on_conflict: true
+  allow_pdf_when_flat: true
+  block_on_conflict: false
   include_pdf_pairs: true
-  relax_min_score: false
-  # When pair not in PDF, still trade from candle learning + market
+  relax_min_score: true
   allow_pattern_fallback: true
 
-# Learn from old candles to predict entries (used when PDF has no idea)
 patterns:
   enabled: true
-  history_period: "30d"       # longer history to study patterns
-  horizon_bars: 6             # look N candles ahead when scoring past patterns
-  sequence_length: 5          # fingerprint of last N candles
-  min_win_rate: 0.55          # require historical edge
-  min_samples: 8
-  min_pattern_score: 2
-  fill_when_flat: true        # enter from patterns if tech flat
+  history_period: "20d"
+  horizon_bars: 4
+  sequence_length: 4
+  min_win_rate: 0.48
+  min_samples: 6
+  min_pattern_score: 1
+  fill_when_flat: true
+  allow_weak_patterns: true   # still use patterns with modest WR
   agree_boost: 1
-  penalize_conflict: true
+  penalize_conflict: false    # don't kill good tech longs on weak pattern conflict
 
 quiet_hours:
   start_hour_utc: null

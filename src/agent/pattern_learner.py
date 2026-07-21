@@ -299,15 +299,19 @@ def learn_from_candles(
         wr = float(st.get("win_rate", 0.5))
         n = int(st.get("samples", 0))
         reasons.append(f"Pattern `{name}` → {side} (hist WR={wr:.0%} n={n})")
-        # discount patterns with poor history
-        if n >= min_samples and wr < min_wr:
+        # Soft history: weak WR only reduces weight (doesn't always skip)
+        allow_weak = bool(cfg.get("allow_weak_patterns", True))
+        if n >= min_samples and wr < min_wr and not allow_weak:
             reasons.append(f"  skipped `{name}` — weak history")
             continue
         if n >= min_samples and wr >= min_wr:
-            pts = weight + (1 if wr >= 0.6 else 0)
+            pts = weight + (1 if wr >= 0.55 else 0)
+        elif n >= min_samples and wr < min_wr:
+            pts = max(1, weight - 1)  # still usable, lower weight
+            reasons.append(f"  weak WR `{name}` — reduced weight")
         else:
-            # new/rare pattern — half weight
-            pts = max(1, weight - 1)
+            # new/rare pattern — keep weight
+            pts = weight
         if side == "BUY":
             buy_pts += pts
         else:
